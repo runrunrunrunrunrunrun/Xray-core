@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package xray.proxy.netbird;
+option csharp_namespace = "Xray.Proxy.NetBird";
+option go_package = "github.com/xtls/xray-core/proxy/netbird";
+option java_package = "com.xray.proxy.netbird";
+option java_multiple_files = true;
+
+message Config {
+  string device_name = 1;
+  string setup_key = 2;
+  string jwt_token = 3;
+  string private_key = 4;
+  string management_url = 5;
+  string pre_shared_key = 6;
+  string config_path = 7;
+  string state_path = 8;
+  string log_level = 9;
+  uint32 mtu = 10;
+  optional int32 wireguard_port = 11;
+  bool disable_client_routes = 12;
+  bool disable_ipv6 = 13;
+  bool block_inbound = 14;
+  bool block_lan_access = 15;
+  bool enable_rosenpass = 16;
+  bool rosenpass_permissive = 17;
+  optional bool lazy_connection = 18;
+  repeated string dns_labels = 19;
+  repeated string nat_external_ips = 20;
+  uint32 startup_timeout = 21;
+}
