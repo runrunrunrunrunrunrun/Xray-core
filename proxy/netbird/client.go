@@ -42,6 +42,11 @@ type netbirdClient interface {
 	ListenUDP(address string) (net.PacketConn, error)
 }
 
+type (
+	clientFactoryFn func(opts embed.Options) (netbirdClient, error)
+	oauthLoginFn    func(ctx context.Context, managementURL, existingPrivateKey string) (string, error)
+)
+
 type clientState uint8
 
 const (
@@ -54,16 +59,30 @@ const (
 // Handler implements proxy.Outbound for the NetBird embedded userspace client.
 type Handler struct {
 	policyManager   policy.Manager
-	client          netbirdClient
 	startupTimeout  time.Duration
+	oauthTimeout    time.Duration
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
 
+	oauthMode     bool
+	baseOpts      embed.Options
+	managementURL string
+	configPath    string
+	newClientFn   clientFactoryFn
+	oauthLoginFn  oauthLoginFn
+
 	mu           sync.Mutex
+	client       netbirdClient
 	state        clientState
 	startCancel  context.CancelFunc
 	startDone    chan struct{}
 	lastStartErr error
+}
+
+func defaultNewClient(opts embed.Options) (netbirdClient, error) {
+	embedInitMu.Lock()
+	defer embedInitMu.Unlock()
+	return embed.New(opts)
 }
 
 // NewClient creates a new NetBird outbound handler and begins connecting in the background.
@@ -135,19 +154,21 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		opts.MTU = &mtu
 	}
 
-	embedInitMu.Lock()
-	client, err := embed.New(opts)
-	embedInitMu.Unlock()
-	if err != nil {
-		return nil, errors.New("failed to create netbird client").Base(err)
-	}
-
 	startupTimeout := time.Duration(conf.StartupTimeout) * time.Second
 	if startupTimeout <= 0 {
 		startupTimeout = defaultStartupTimeout
 	}
 
-	return newHandler(p, client, startupTimeout, uplinkCounter, downlinkCounter, true), nil
+	oauthMode := conf.SetupKey == "" && conf.JwtToken == "" && conf.PrivateKey == ""
+	if !oauthMode {
+		client, err := defaultNewClient(opts)
+		if err != nil {
+			return nil, errors.New("failed to create netbird client").Base(err)
+		}
+		return newHandler(p, client, startupTimeout, uplinkCounter, downlinkCounter, true), nil
+	}
+
+	return newOAuthHandler(p, opts, conf.ManagementUrl, conf.ConfigPath, startupTimeout, defaultOAuthTimeout, uplinkCounter, downlinkCounter, defaultNewClient, obtainOAuthToken, true), nil
 }
 
 func newHandler(p policy.Manager, client netbirdClient, startupTimeout time.Duration, uplinkCounter, downlinkCounter stats.Counter, autoStart bool) *Handler {
@@ -170,6 +191,47 @@ func newHandler(p policy.Manager, client netbirdClient, startupTimeout time.Dura
 	return h
 }
 
+func newOAuthHandler(
+	p policy.Manager,
+	baseOpts embed.Options,
+	managementURL string,
+	configPath string,
+	startupTimeout time.Duration,
+	oauthTimeout time.Duration,
+	uplinkCounter stats.Counter,
+	downlinkCounter stats.Counter,
+	newClientFn clientFactoryFn,
+	oauthLoginFn oauthLoginFn,
+	autoStart bool,
+) *Handler {
+	if startupTimeout <= 0 {
+		startupTimeout = defaultStartupTimeout
+	}
+	if oauthTimeout <= 0 {
+		oauthTimeout = defaultOAuthTimeout
+	}
+	h := &Handler{
+		policyManager:   p,
+		startupTimeout:  startupTimeout,
+		oauthTimeout:    oauthTimeout,
+		uplinkCounter:   uplinkCounter,
+		downlinkCounter: downlinkCounter,
+		oauthMode:       true,
+		baseOpts:        baseOpts,
+		managementURL:   managementURL,
+		configPath:      configPath,
+		newClientFn:     newClientFn,
+		oauthLoginFn:    oauthLoginFn,
+		state:           stateIdle,
+	}
+	if autoStart {
+		h.mu.Lock()
+		h.triggerStartLocked()
+		h.mu.Unlock()
+	}
+	return h
+}
+
 func validateConfig(conf *Config) error {
 	creds := 0
 	if conf.SetupKey != "" {
@@ -180,9 +242,6 @@ func validateConfig(conf *Config) error {
 	}
 	if conf.PrivateKey != "" {
 		creds++
-	}
-	if creds == 0 {
-		return errors.New("one of setupKey, jwtToken, or privateKey must be provided")
 	}
 	if creds > 1 {
 		return errors.New("only one of setupKey, jwtToken, or privateKey can be specified")
@@ -198,13 +257,17 @@ func validateConfig(conf *Config) error {
 
 func (h *Handler) triggerStartLocked() {
 	h.state = stateStarting
-	startCtx, cancel := context.WithTimeout(context.Background(), h.startupTimeout)
+	totalTimeout := h.startupTimeout
+	if h.oauthMode {
+		totalTimeout = h.oauthTimeout + h.startupTimeout
+	}
+	startCtx, cancel := context.WithTimeout(context.Background(), totalTimeout)
 	done := make(chan struct{})
 	h.startCancel = cancel
 	h.startDone = done
 
 	go func() {
-		err := h.client.Start(startCtx)
+		client, err := h.startClient(startCtx)
 		cancel()
 
 		h.mu.Lock()
@@ -213,9 +276,9 @@ func (h *Handler) triggerStartLocked() {
 		}
 		if h.state == stateClosed {
 			h.mu.Unlock()
-			if err == nil {
+			if err == nil && client != nil {
 				stopCtx, stopCancel := context.WithTimeout(context.Background(), shutdownTimeout)
-				_ = h.client.Stop(stopCtx)
+				_ = client.Stop(stopCtx)
 				stopCancel()
 			}
 			close(done)
@@ -223,6 +286,7 @@ func (h *Handler) triggerStartLocked() {
 		}
 
 		if err == nil {
+			h.client = client
 			h.state = stateStarted
 			h.lastStartErr = nil
 		} else {
@@ -233,6 +297,62 @@ func (h *Handler) triggerStartLocked() {
 		close(done)
 		h.mu.Unlock()
 	}()
+}
+
+func (h *Handler) startClient(startCtx context.Context) (netbirdClient, error) {
+	if !h.oauthMode {
+		if err := h.client.Start(startCtx); err != nil {
+			return nil, err
+		}
+		return h.client, nil
+	}
+
+	existingKey := readPrivateKeyFromConfig(h.configPath)
+	if existingKey != "" {
+		opts := h.baseOpts
+		opts.PrivateKey = existingKey
+		opts.JWTToken = ""
+		opts.SetupKey = ""
+
+		if c, err := h.newClientFn(opts); err == nil {
+			connectCtx, connectCancel := context.WithTimeout(startCtx, h.startupTimeout)
+			startErr := c.Start(connectCtx)
+			connectCancel()
+			if startErr == nil {
+				return c, nil
+			}
+			if startCtx.Err() != nil {
+				return nil, startCtx.Err()
+			}
+			errors.LogWarningInner(context.Background(), startErr, "netbird saved peer login failed, starting interactive OAuth")
+		} else {
+			errors.LogWarningInner(context.Background(), err, "netbird saved peer init failed, starting interactive OAuth")
+		}
+	}
+
+	oauthCtx, oauthCancel := context.WithTimeout(startCtx, h.oauthTimeout)
+	jwtToken, err := h.oauthLoginFn(oauthCtx, h.managementURL, existingKey)
+	oauthCancel()
+	if err != nil {
+		return nil, err
+	}
+
+	opts := h.baseOpts
+	opts.JWTToken = jwtToken
+	opts.PrivateKey = ""
+	opts.SetupKey = ""
+
+	c, err := h.newClientFn(opts)
+	if err != nil {
+		return nil, errors.New("failed to create netbird client after OAuth").Base(err)
+	}
+
+	connectCtx, connectCancel := context.WithTimeout(startCtx, h.startupTimeout)
+	defer connectCancel()
+	if err := c.Start(connectCtx); err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 func (h *Handler) ensureStarted(ctx context.Context) error {
@@ -266,6 +386,12 @@ func (h *Handler) ensureStarted(ctx context.Context) error {
 	default:
 		return errors.New("failed to start netbird client").Base(h.lastStartErr)
 	}
+}
+
+func (h *Handler) getClient() netbirdClient {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.client
 }
 
 // Process implements proxy.Outbound.Process.
@@ -308,12 +434,19 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		dialCtx, dialCancel = context.WithTimeout(ctx, sessionPolicy.Timeouts.Handshake)
 	}
 
-	err := h.ensureStarted(dialCtx)
-	if err != nil {
+	if err := h.ensureStarted(dialCtx); err != nil {
 		if dialCancel != nil {
 			dialCancel()
 		}
 		return err
+	}
+
+	client := h.getClient()
+	if client == nil {
+		if dialCancel != nil {
+			dialCancel()
+		}
+		return errors.New("netbird client not initialized")
 	}
 
 	var reader buf.Reader
@@ -321,7 +454,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	switch ob.Target.Network {
 	case net.Network_TCP:
-		conn, err := h.client.DialContext(dialCtx, "tcp", ob.Target.NetAddr())
+		conn, err := client.DialContext(dialCtx, "tcp", ob.Target.NetAddr())
 		if dialCancel != nil {
 			dialCancel()
 		}
@@ -346,7 +479,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			}
 			// ListenUDP(":0") binds NetBird's primary IPv4 tunnel address and supports
 			// Full-Cone multi-destination UDP just like Xray's wireguard outbound.
-			pktConn, err := h.client.ListenUDP(":0")
+			pktConn, err := client.ListenUDP(":0")
 			if err != nil {
 				return errors.New("failed to create UDP listener").Base(err)
 			}
@@ -370,7 +503,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		} else {
 			// Domain and IPv6 UDP targets use DialContext so NetBird's netstack DNS
 			// resolves domain names and gVisor selects the matching IP protocol stack.
-			conn, err := h.client.DialContext(dialCtx, "udp", ob.Target.NetAddr())
+			conn, err := client.DialContext(dialCtx, "udp", ob.Target.NetAddr())
 			if dialCancel != nil {
 				dialCancel()
 			}
@@ -432,6 +565,7 @@ func (h *Handler) Close() error {
 		return nil
 	}
 	wasStarted := h.state == stateStarted
+	client := h.client
 	cancel := h.startCancel
 	done := h.startDone
 	h.state = stateClosed
@@ -449,10 +583,10 @@ func (h *Handler) Close() error {
 		case <-timer.C:
 		}
 	}
-	if wasStarted {
+	if wasStarted && client != nil {
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), shutdownTimeout)
 		defer stopCancel()
-		return h.client.Stop(stopCtx)
+		return client.Stop(stopCtx)
 	}
 	return nil
 }

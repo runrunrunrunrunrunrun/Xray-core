@@ -43,9 +43,6 @@ func (c *NetBirdConfig) Build() (proto.Message, error) {
 	if c.PrivateKey != "" {
 		creds++
 	}
-	if creds == 0 {
-		return nil, errors.New("one of setupKey, jwtToken, or privateKey must be provided")
-	}
 	if creds > 1 {
 		return nil, errors.New("only one of setupKey, jwtToken, or privateKey can be specified")
 	}

@@ -185,9 +185,9 @@ func TestValidateConfig(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name:    "missing credentials",
+			name:    "empty credentials uses OAuth mode",
 			conf:    &Config{},
-			wantErr: true,
+			wantErr: false,
 		},
 		{
 			name:    "multiple credentials",

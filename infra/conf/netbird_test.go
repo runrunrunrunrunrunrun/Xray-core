@@ -86,10 +86,17 @@ func TestNetBirdConfig(t *testing.T) {
 				StartupTimeout: 30,
 			},
 		},
+		{
+			Input:  `{}`,
+			Parser: loadJSON(creator),
+			Output: &netbird.Config{
+				BlockInbound:   true,
+				StartupTimeout: 30,
+			},
+		},
 	})
 
 	invalidConfigs := []string{
-		`{}`,
 		`{"setupKey": "a", "jwtToken": "b"}`,
 		`{"setupKey": "a", "mtu": 500}`,
 		`{"setupKey": "a", "mtu": 9000}`,
