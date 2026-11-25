@@ -40,6 +40,7 @@ type netbirdClient interface {
 	Stop(ctx context.Context) error
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 	ListenUDP(address string) (net.PacketConn, error)
+	StatusSnapshot() (*StatusDetail, error)
 }
 
 type (
@@ -63,6 +64,7 @@ type Handler struct {
 	oauthTimeout    time.Duration
 	uplinkCounter   stats.Counter
 	downlinkCounter stats.Counter
+	registryKey     string
 
 	oauthMode     bool
 	baseOpts      embed.Options
@@ -82,7 +84,11 @@ type Handler struct {
 func defaultNewClient(opts embed.Options) (netbirdClient, error) {
 	embedInitMu.Lock()
 	defer embedInitMu.Unlock()
-	return embed.New(opts)
+	c, err := embed.New(opts)
+	if err != nil {
+		return nil, err
+	}
+	return embedClientAdapter{Client: c}, nil
 }
 
 // NewClient creates a new NetBird outbound handler and begins connecting in the background.
@@ -97,10 +103,11 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 	v := core.MustFromContext(ctx)
 	p := v.GetFeature(policy.ManagerType()).(policy.Manager)
 
+	var tag string
 	var uplinkCounter stats.Counter
 	var downlinkCounter stats.Counter
 	if fh := session.FullHandlerFromContext(ctx); fh != nil {
-		tag := fh.Tag()
+		tag = fh.Tag()
 		if len(tag) > 0 && p.ForSystem().Stats.OutboundUplink {
 			statsManager := v.GetFeature(stats.ManagerType()).(stats.Manager)
 			if c, _ := statsManager.GetOrRegisterCounter("outbound>>>" + tag + ">>>traffic>>>uplink"); c != nil {
@@ -165,13 +172,23 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		if err != nil {
 			return nil, errors.New("failed to create netbird client").Base(err)
 		}
-		return newHandler(p, client, startupTimeout, uplinkCounter, downlinkCounter, true), nil
+		h := newHandlerWithTag(tag, p, client, startupTimeout, uplinkCounter, downlinkCounter, false)
+		h.baseOpts = opts
+		h.managementURL = conf.ManagementUrl
+		h.mu.Lock()
+		h.triggerStartLocked()
+		h.mu.Unlock()
+		return h, nil
 	}
 
-	return newOAuthHandler(p, opts, conf.ManagementUrl, conf.ConfigPath, startupTimeout, defaultOAuthTimeout, uplinkCounter, downlinkCounter, defaultNewClient, obtainOAuthToken, true), nil
+	return newOAuthHandlerWithTag(tag, p, opts, conf.ManagementUrl, conf.ConfigPath, startupTimeout, defaultOAuthTimeout, uplinkCounter, downlinkCounter, defaultNewClient, obtainOAuthToken, true), nil
 }
 
 func newHandler(p policy.Manager, client netbirdClient, startupTimeout time.Duration, uplinkCounter, downlinkCounter stats.Counter, autoStart bool) *Handler {
+	return newHandlerWithTag("", p, client, startupTimeout, uplinkCounter, downlinkCounter, autoStart)
+}
+
+func newHandlerWithTag(tag string, p policy.Manager, client netbirdClient, startupTimeout time.Duration, uplinkCounter, downlinkCounter stats.Counter, autoStart bool) *Handler {
 	if startupTimeout <= 0 {
 		startupTimeout = defaultStartupTimeout
 	}
@@ -183,6 +200,7 @@ func newHandler(p policy.Manager, client netbirdClient, startupTimeout time.Dura
 		downlinkCounter: downlinkCounter,
 		state:           stateIdle,
 	}
+	h.registerHandler(tag)
 	if autoStart {
 		h.mu.Lock()
 		h.triggerStartLocked()
@@ -192,6 +210,23 @@ func newHandler(p policy.Manager, client netbirdClient, startupTimeout time.Dura
 }
 
 func newOAuthHandler(
+	p policy.Manager,
+	baseOpts embed.Options,
+	managementURL string,
+	configPath string,
+	startupTimeout time.Duration,
+	oauthTimeout time.Duration,
+	uplinkCounter stats.Counter,
+	downlinkCounter stats.Counter,
+	newClientFn clientFactoryFn,
+	oauthLoginFn oauthLoginFn,
+	autoStart bool,
+) *Handler {
+	return newOAuthHandlerWithTag("", p, baseOpts, managementURL, configPath, startupTimeout, oauthTimeout, uplinkCounter, downlinkCounter, newClientFn, oauthLoginFn, autoStart)
+}
+
+func newOAuthHandlerWithTag(
+	tag string,
 	p policy.Manager,
 	baseOpts embed.Options,
 	managementURL string,
@@ -224,6 +259,7 @@ func newOAuthHandler(
 		oauthLoginFn:    oauthLoginFn,
 		state:           stateIdle,
 	}
+	h.registerHandler(tag)
 	if autoStart {
 		h.mu.Lock()
 		h.triggerStartLocked()
@@ -559,6 +595,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
+	h.unregisterHandler()
+
 	h.mu.Lock()
 	if h.state == stateClosed {
 		h.mu.Unlock()

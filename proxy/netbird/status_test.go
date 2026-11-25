@@ -1,0 +1,83 @@
+package netbird
+
+import (
+	"context"
+	stderrors "errors"
+	"testing"
+	"time"
+)
+
+func TestHandlerStatusSnapshotAndExpvar(t *testing.T) {
+	pm := newTestPolicyManager(t)
+
+	client := &fakeNetbirdClient{
+		statusSnapshotFn: func() (*StatusDetail, error) {
+			return &StatusDetail{
+				ManagementConnected:   true,
+				SignalConnected:       true,
+				LocalIP:               "100.77.220.113",
+				FQDN:                  "onexray.net.loop",
+				PubKey:                "pub-local",
+				LazyConnectionEnabled: true,
+				PeersTotal:            1,
+				PeersConnected:        1,
+				Relays: []RelayStatusSnapshot{
+					{URI: "rels://relay.l0op.site:8443", Available: true, Transport: "quic"},
+				},
+				Peers: []PeerStatusSnapshot{
+					{
+						IP:        "100.77.0.10",
+						FQDN:      "nas.net.loop",
+						PubKey:    "pub-nas",
+						Status:    "Connected",
+						LatencyMs: 12,
+						BytesTx:   1024,
+						BytesRx:   2048,
+						Routes:    []string{"10.113.0.0/16"},
+					},
+				},
+				Routes: []string{"10.113.0.0/16"},
+			}, nil
+		},
+	}
+
+	h := newHandlerWithTag("nb-status-test", pm, client, time.Second, nil, nil, true)
+	h.managementURL = "https://net.l0op.site"
+	h.baseOpts.DeviceName = "onexray-device"
+
+	if err := h.ensureStarted(context.Background()); err != nil {
+		t.Fatalf("ensureStarted failed: %v", err)
+	}
+
+	raw := activeNetBirdStatus().(map[string]StatusSnapshot)
+	snap, ok := raw["nb-status-test"]
+	if !ok {
+		t.Fatalf("expected nb-status-test in activeNetBirdStatus, got %+v", raw)
+	}
+	if snap.State != "started" || snap.LocalIP != "100.77.220.113" || snap.PeersConnected != 1 {
+		t.Fatalf("unexpected status snapshot: %+v", snap)
+	}
+	if len(snap.Relays) != 1 || snap.Relays[0].Transport != "quic" {
+		t.Fatalf("unexpected relays: %+v", snap.Relays)
+	}
+
+	_ = h.Close()
+	rawAfter := activeNetBirdStatus().(map[string]StatusSnapshot)
+	if _, exists := rawAfter["nb-status-test"]; exists {
+		t.Fatal("expected handler to be unregistered after Close")
+	}
+
+	// Verify LoginExpired detection on expired peer error.
+	hExp := newHandlerWithTag("nb-expired-test", pm, &fakeNetbirdClient{
+		startFn: func(context.Context) error {
+			return stderrors.New("login: rpc error: code = PermissionDenied desc = peer login has expired")
+		},
+	}, time.Second, nil, nil, true)
+	defer hExp.Close()
+
+	_ = hExp.ensureStarted(context.Background())
+	expSnap := hExp.StatusSnapshot()
+	if !expSnap.LoginExpired {
+		t.Fatalf("expected LoginExpired=true, got %+v", expSnap)
+	}
+}

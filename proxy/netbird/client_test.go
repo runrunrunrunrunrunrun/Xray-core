@@ -24,13 +24,21 @@ import (
 )
 
 type fakeNetbirdClient struct {
-	startFn       func(ctx context.Context) error
-	stopFn        func(ctx context.Context) error
-	dialContextFn func(ctx context.Context, network, address string) (net.Conn, error)
-	listenUDPFn   func(address string) (net.PacketConn, error)
+	startFn          func(ctx context.Context) error
+	stopFn           func(ctx context.Context) error
+	dialContextFn    func(ctx context.Context, network, address string) (net.Conn, error)
+	listenUDPFn      func(address string) (net.PacketConn, error)
+	statusSnapshotFn func() (*StatusDetail, error)
 
 	startCalls atomic.Int32
 	stopCalls  atomic.Int32
+}
+
+func (f *fakeNetbirdClient) StatusSnapshot() (*StatusDetail, error) {
+	if f.statusSnapshotFn != nil {
+		return f.statusSnapshotFn()
+	}
+	return &StatusDetail{}, nil
 }
 
 func (f *fakeNetbirdClient) Start(ctx context.Context) error {

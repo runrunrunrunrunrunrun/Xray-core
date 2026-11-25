@@ -1,0 +1,55 @@
+diff --git a/client/net/protectsocket_android.go b/client/net/protectsocket_android.go
+--- a/client/net/protectsocket_android.go
++++ b/client/net/protectsocket_android.go
+@@ -6,8 +6,6 @@ import (
+ 	"sync"
+ 	"syscall"
+-
+-	"github.com/netbirdio/netbird/client/iface/netstack"
+ )
+ 
+ var (
+@@ -22,9 +20,6 @@ func SetAndroidProtectSocketFn(fn func(fd int32) bool) {
+ 
+ // ControlProtectSocket is a Control function that sets the fwmark on the socket
+ func ControlProtectSocket(_, _ string, c syscall.RawConn) error {
+-	if netstack.IsEnabled() {
+-		return nil
+-	}
+ 	var aErr error
+ 	err := c.Control(func(fd uintptr) {
+ 		androidProtectSocketLock.Lock()
+diff --git a/client/net/env_bound_iface.go b/client/net/env_bound_iface.go
+--- a/client/net/env_bound_iface.go
++++ b/client/net/env_bound_iface.go
+@@ -4,7 +4,6 @@ package net
+ import (
+ 	"os"
+ 	"strconv"
+ 	"sync"
+ 
+ 	log "github.com/sirupsen/logrus"
+-
+-	"github.com/netbirdio/netbird/client/iface/netstack"
+ )
+@@ -36,10 +35,6 @@ func checkAdvancedRoutingSupport() bool {
+ 	if legacyRouting {
+ 		log.Infof("advanced routing disabled: legacy routing requested via %s", envUseLegacyRouting)
+ 		return false
+ 	}
+-	if netstack.IsEnabled() {
+-		log.Info("advanced routing disabled: netstack mode is enabled")
+-		return false
+-	}
+ 
+ 	log.Info("system supports advanced routing")
+diff --git a/client/net/env_linux.go b/client/net/env_linux.go
+--- a/client/net/env_linux.go
++++ b/client/net/env_linux.go
+@@ -1,6 +1,6 @@
+ //go:build !android
+ 
+ package net
+ 
+ // Keep ControlPlaneMark / SO_MARK active in netstack mode when running alongside a host TUN.
+ // Apply the same netstack guard removal as client/net/env_bound_iface.go in your netbird fork.
