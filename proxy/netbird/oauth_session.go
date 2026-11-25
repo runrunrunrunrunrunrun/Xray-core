@@ -2,9 +2,6 @@ package netbird
 
 import (
 	"context"
-	"crypto/sha256"
-	"crypto/subtle"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"golang.org/x/oauth2"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,6 +22,14 @@ import (
 	mgm "github.com/netbirdio/netbird/shared/management/client"
 	mgmcommon "github.com/netbirdio/netbird/shared/management/client/common"
 )
+
+// OAuthStartOptions configures interactive NetBird OAuth initialization.
+type OAuthStartOptions struct {
+	ManagementURL      string
+	ExistingPrivateKey string
+	ForceDeviceFlow    bool
+	LoginHint          string
+}
 
 // OAuthStartResult describes an in-progress interactive NetBird OAuth session.
 type OAuthStartResult struct {
@@ -77,83 +81,26 @@ func (c realMgmRegisterClient) Register(setupKey string, jwtToken string, sysInf
 	return resp.GetPeerConfig().GetAddress(), resp.GetPeerConfig().GetFqdn(), nil
 }
 
-var (
-	oauthSessionsMu sync.Mutex
-	oauthSessions   = make(map[string]*oauthSession)
-	newMgmRegClient = func(ctx context.Context, host string, key wgtypes.Key, tlsEnabled bool) (mgmRegisterClient, error) {
-		c, err := mgm.NewClient(ctx, host, key, tlsEnabled)
-		if err != nil {
-			return nil, err
-		}
-		return realMgmRegisterClient{GrpcClient: c}, nil
-	}
-)
+type oauthDiscoveryClient interface {
+	Close() error
+	GetPKCEAuthorizationFlow(sessionExtend bool) (pkceAuthConfig, error)
+	GetDeviceAuthorizationFlow() (deviceAuthConfig, error)
+}
 
-// StartOAuthSession initiates a NetBird Device Code or PKCE OAuth session and returns
-// the authorization URL immediately without blocking for browser completion.
-func StartOAuthSession(ctx context.Context, managementURL, existingPrivateKey string) (*OAuthStartResult, error) {
-	host, tlsEnabled, err := parseManagementURL(managementURL)
+type realMgmDiscoveryClient struct {
+	*mgm.GrpcClient
+}
+
+func (c realMgmDiscoveryClient) GetPKCEAuthorizationFlow(sessionExtend bool) (pkceAuthConfig, error) {
+	flow, err := c.GrpcClient.GetPKCEAuthorizationFlow(sessionExtend)
 	if err != nil {
-		return nil, err
+		return pkceAuthConfig{}, err
 	}
-	normalizedMgmtURL := "https://" + host
-	if !tlsEnabled {
-		normalizedMgmtURL = "http://" + host
+	if flow == nil || flow.GetProviderConfig() == nil {
+		return pkceAuthConfig{}, errors.New("management server returned empty PKCE authorization flow config")
 	}
-	if strings.TrimSpace(managementURL) != "" {
-		normalizedMgmtURL = strings.TrimSpace(managementURL)
-	}
-
-	var key wgtypes.Key
-	if strings.TrimSpace(existingPrivateKey) != "" {
-		key, err = wgtypes.ParseKey(strings.TrimSpace(existingPrivateKey))
-	}
-	if strings.TrimSpace(existingPrivateKey) == "" || err != nil {
-		key, err = wgtypes.GeneratePrivateKey()
-		if err != nil {
-			return nil, fmt.Errorf("generate wireguard key: %w", err)
-		}
-	}
-
-	mgmClient, err := mgm.NewClient(ctx, host, key, tlsEnabled)
-	if err != nil {
-		return nil, fmt.Errorf("connect management server %s: %w", host, err)
-	}
-	defer mgmClient.Close()
-
-	deviceFlow, deviceErr := mgmClient.GetDeviceAuthorizationFlow()
-	if deviceErr == nil && deviceFlow != nil && deviceFlow.GetProviderConfig() != nil {
-		p := deviceFlow.GetProviderConfig()
-		return startDeviceOAuthSession(ctx, normalizedMgmtURL, host, tlsEnabled, key, deviceAuthConfig{
-			ClientID:           p.GetClientID(),
-			ClientSecret:       p.GetClientSecret(), //nolint:staticcheck
-			Audience:           p.GetAudience(),
-			TokenEndpoint:      p.GetTokenEndpoint(),
-			DeviceAuthEndpoint: p.GetDeviceAuthEndpoint(),
-			Scope:              p.GetScope(),
-			UseIDToken:         p.GetUseIDToken(),
-		}, nil)
-	}
-
-	if deviceErr != nil {
-		if s, ok := status.FromError(deviceErr); ok && s.Code() != codes.NotFound && s.Code() != codes.Unimplemented {
-			return nil, fmt.Errorf("get device authorization flow: %w", deviceErr)
-		}
-	}
-
-	pkceFlow, pkceErr := mgmClient.GetPKCEAuthorizationFlow(false)
-	if pkceErr != nil {
-		if deviceErr != nil {
-			return nil, fmt.Errorf("get oauth flow (device: %v; pkce: %w)", deviceErr, pkceErr)
-		}
-		return nil, fmt.Errorf("get pkce authorization flow: %w", pkceErr)
-	}
-	if pkceFlow == nil || pkceFlow.GetProviderConfig() == nil {
-		return nil, errors.New("management server returned empty PKCE authorization flow config")
-	}
-
-	p := pkceFlow.GetProviderConfig()
-	return startPKCEOAuthSession(normalizedMgmtURL, host, tlsEnabled, key, pkceAuthConfig{
+	p := flow.GetProviderConfig()
+	return pkceAuthConfig{
 		ClientID:              p.GetClientID(),
 		ClientSecret:          p.GetClientSecret(), //nolint:staticcheck
 		Audience:              p.GetAudience(),
@@ -164,7 +111,124 @@ func StartOAuthSession(ctx context.Context, managementURL, existingPrivateKey st
 		UseIDToken:            p.GetUseIDToken(),
 		DisablePromptLogin:    p.GetDisablePromptLogin(),
 		LoginFlag:             mgmcommon.LoginFlag(p.GetLoginFlag()),
+	}, nil
+}
+
+func (c realMgmDiscoveryClient) GetDeviceAuthorizationFlow() (deviceAuthConfig, error) {
+	flow, err := c.GrpcClient.GetDeviceAuthorizationFlow()
+	if err != nil {
+		return deviceAuthConfig{}, err
+	}
+	if flow == nil || flow.GetProviderConfig() == nil {
+		return deviceAuthConfig{}, errors.New("management server returned empty device authorization flow config")
+	}
+	p := flow.GetProviderConfig()
+	return deviceAuthConfig{
+		ClientID:           p.GetClientID(),
+		ClientSecret:       p.GetClientSecret(), //nolint:staticcheck
+		Audience:           p.GetAudience(),
+		TokenEndpoint:      p.GetTokenEndpoint(),
+		DeviceAuthEndpoint: p.GetDeviceAuthEndpoint(),
+		Scope:              p.GetScope(),
+		UseIDToken:         p.GetUseIDToken(),
+	}, nil
+}
+
+var (
+	oauthSessionsMu       sync.Mutex
+	oauthSessions         = make(map[string]*oauthSession)
+	newMgmDiscoveryClient = func(ctx context.Context, host string, key wgtypes.Key, tlsEnabled bool) (oauthDiscoveryClient, error) {
+		c, err := mgm.NewClient(ctx, host, key, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		return realMgmDiscoveryClient{GrpcClient: c}, nil
+	}
+	newMgmRegClient = func(ctx context.Context, host string, key wgtypes.Key, tlsEnabled bool) (mgmRegisterClient, error) {
+		c, err := mgm.NewClient(ctx, host, key, tlsEnabled)
+		if err != nil {
+			return nil, err
+		}
+		return realMgmRegisterClient{GrpcClient: c}, nil
+	}
+)
+
+// StartOAuthSession initiates a NetBird PKCE or Device Code OAuth session and returns
+// the authorization URL immediately without blocking for browser completion.
+func StartOAuthSession(ctx context.Context, managementURL, existingPrivateKey string) (*OAuthStartResult, error) {
+	return StartOAuthSessionWithOptions(ctx, OAuthStartOptions{
+		ManagementURL:      managementURL,
+		ExistingPrivateKey: existingPrivateKey,
 	})
+}
+
+// StartOAuthSessionWithOptions mirrors NetBird client/internal/auth/oauth.go:NewOAuthFlow:
+// it tries PKCE Authorization Code Flow first (passing sessionExtend when reusing an
+// existing peer key), falling back to Device Authorization Flow if PKCE fails or if
+// ForceDeviceFlow is set.
+func StartOAuthSessionWithOptions(ctx context.Context, opts OAuthStartOptions) (*OAuthStartResult, error) {
+	host, tlsEnabled, err := parseManagementURL(opts.ManagementURL)
+	if err != nil {
+		return nil, err
+	}
+	normalizedMgmtURL := "https://" + host
+	if !tlsEnabled {
+		normalizedMgmtURL = "http://" + host
+	}
+	if strings.TrimSpace(opts.ManagementURL) != "" {
+		normalizedMgmtURL = strings.TrimSpace(opts.ManagementURL)
+	}
+
+	trimmedExisting := strings.TrimSpace(opts.ExistingPrivateKey)
+	sessionExtend := trimmedExisting != ""
+
+	var key wgtypes.Key
+	if sessionExtend {
+		key, err = wgtypes.ParseKey(trimmedExisting)
+	}
+	if !sessionExtend || err != nil {
+		sessionExtend = false
+		key, err = wgtypes.GeneratePrivateKey()
+		if err != nil {
+			return nil, fmt.Errorf("generate wireguard key: %w", err)
+		}
+	}
+
+	mgmClient, err := newMgmDiscoveryClient(ctx, host, key, tlsEnabled)
+	if err != nil {
+		return nil, fmt.Errorf("connect management server %s: %w", host, err)
+	}
+	defer mgmClient.Close()
+
+	var pkceErr error
+	if !opts.ForceDeviceFlow {
+		var pkceCfg pkceAuthConfig
+		pkceCfg, pkceErr = mgmClient.GetPKCEAuthorizationFlow(sessionExtend)
+		if pkceErr == nil {
+			pkceCfg.LoginHint = strings.TrimSpace(opts.LoginHint)
+			res, startErr := startPKCEOAuthSession(normalizedMgmtURL, host, tlsEnabled, key, pkceCfg)
+			if startErr == nil {
+				return res, nil
+			}
+			pkceErr = startErr
+		}
+	}
+
+	deviceCfg, deviceErr := mgmClient.GetDeviceAuthorizationFlow()
+	if deviceErr == nil {
+		return startDeviceOAuthSession(ctx, normalizedMgmtURL, host, tlsEnabled, key, deviceCfg, nil)
+	}
+
+	switch s, ok := status.FromError(deviceErr); {
+	case ok && s.Code() == codes.NotFound:
+		return nil, fmt.Errorf("no SSO provider returned from management %s (pkce: %v)", normalizedMgmtURL, pkceErr)
+	case ok && s.Code() == codes.Unimplemented:
+		return nil, fmt.Errorf("the management server %s does not support SSO providers", normalizedMgmtURL)
+	case pkceErr != nil:
+		return nil, fmt.Errorf("get oauth flow (pkce: %v; device: %w)", pkceErr, deviceErr)
+	default:
+		return nil, fmt.Errorf("get device authorization flow: %w", deviceErr)
+	}
 }
 
 func startDeviceOAuthSession(
@@ -175,11 +239,11 @@ func startDeviceOAuthSession(
 	cfg deviceAuthConfig,
 	httpClient *http.Client,
 ) (*OAuthStartResult, error) {
-	if cfg.ClientID == "" || cfg.DeviceAuthEndpoint == "" || cfg.TokenEndpoint == "" {
-		return nil, errors.New("incomplete device authorization flow config from management server")
+	if err := validateDeviceAuthConfig(cfg); err != nil {
+		return nil, err
 	}
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		httpClient = newOAuthHTTPClient(15 * time.Second)
 	}
 	scope := strings.TrimSpace(cfg.Scope)
 	if scope == "" {
@@ -285,14 +349,7 @@ func startDeviceOAuthSession(
 						}
 					}
 
-					token := tokResp.AccessToken
-					if cfg.UseIDToken && tokResp.IDToken != "" {
-						token = tokResp.IDToken
-					}
-					if token == "" {
-						return "", errors.New("device flow returned empty token")
-					}
-					return token, nil
+					return selectToken(tokResp.AccessToken, tokResp.IDToken, cfg.UseIDToken, cfg.Audience)
 				}
 			}
 		},
@@ -317,8 +374,8 @@ func startPKCEOAuthSession(
 	key wgtypes.Key,
 	cfg pkceAuthConfig,
 ) (*OAuthStartResult, error) {
-	if cfg.ClientID == "" || cfg.AuthorizationEndpoint == "" || cfg.TokenEndpoint == "" || len(cfg.RedirectURLs) == 0 {
-		return nil, errors.New("incomplete PKCE authorization flow config from management server")
+	if err := validatePKCEConfig(cfg); err != nil {
+		return nil, err
 	}
 
 	ln, redirectURL, err := bindPKCERedirectListener(cfg.RedirectURLs)
@@ -331,98 +388,20 @@ func startPKCEOAuthSession(
 		_ = ln.Close()
 		return nil, fmt.Errorf("generate PKCE state: %w", err)
 	}
-	codeVerifier, err := randomBase64URLBytes(64)
+	codeVerifier, err := randomHexBytes(32)
 	if err != nil {
 		_ = ln.Close()
 		return nil, fmt.Errorf("generate PKCE verifier: %w", err)
 	}
-	sum := sha256.Sum256([]byte(codeVerifier))
-	codeChallenge := base64.RawURLEncoding.EncodeToString(sum[:])
 
-	scopes := strings.Fields(cfg.Scope)
-	if len(scopes) == 0 {
-		scopes = []string{"openid"}
-	}
-
-	oauthCfg := &oauth2.Config{
-		ClientID:     cfg.ClientID,
-		ClientSecret: cfg.ClientSecret,
-		Endpoint: oauth2.Endpoint{
-			AuthURL:  cfg.AuthorizationEndpoint,
-			TokenURL: cfg.TokenEndpoint,
-		},
-		RedirectURL: redirectURL,
-		Scopes:      scopes,
-	}
-
-	params := []oauth2.AuthCodeOption{
-		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
-		oauth2.SetAuthURLParam("code_challenge", codeChallenge),
-	}
-	if cfg.Audience != "" {
-		params = append(params, oauth2.SetAuthURLParam("audience", cfg.Audience))
-	}
-	if !cfg.DisablePromptLogin {
-		switch cfg.LoginFlag {
-		case mgmcommon.LoginFlagPromptLogin:
-			params = append(params, oauth2.SetAuthURLParam("prompt", "login"))
-		case mgmcommon.LoginFlagMaxAge0:
-			params = append(params, oauth2.SetAuthURLParam("max_age", "0"))
-		}
-	}
-
-	authURL := oauthCfg.AuthCodeURL(state, params...)
-	tokenCh := make(chan *oauth2.Token, 1)
+	oauthCfg, authURL := buildPKCEOAuthConfigAndURL(cfg, redirectURL, state, codeVerifier)
+	tokenCh := make(chan string, 1)
 	errCh := make(chan error, 1)
+	httpClient := newOAuthHTTPClient(15 * time.Second)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		q := req.URL.Query()
-		if authErr := q.Get("error"); authErr != "" {
-			desc := q.Get("error_description")
-			if desc != "" {
-				authErr = desc
-			}
-			writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: "+authErr)
-			select {
-			case errCh <- fmt.Errorf("PKCE authorization error: %s", authErr):
-			default:
-			}
-			return
-		}
-		if subtle.ConstantTimeCompare([]byte(state), []byte(q.Get("state"))) == 0 {
-			writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: invalid state")
-			select {
-			case errCh <- errors.New("PKCE authorization failed: invalid state"):
-			default:
-			}
-			return
-		}
-		code := q.Get("code")
-		if code == "" {
-			writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: missing authorization code")
-			select {
-			case errCh <- errors.New("PKCE authorization failed: missing code"):
-			default:
-			}
-			return
-		}
-
-		tok, exchangeErr := oauthCfg.Exchange(req.Context(), code, oauth2.SetAuthURLParam("code_verifier", codeVerifier))
-		if exchangeErr != nil {
-			writePKCEResponse(w, http.StatusBadGateway, "NetBird token exchange failed: "+exchangeErr.Error())
-			select {
-			case errCh <- fmt.Errorf("PKCE token exchange: %w", exchangeErr):
-			default:
-			}
-			return
-		}
-
-		writePKCEResponse(w, http.StatusOK, "NetBird login successful. You can close this window.")
-		select {
-		case tokenCh <- tok:
-		default:
-		}
+		handlePKCECallback(w, req, state, codeVerifier, cfg, oauthCfg, httpClient, tokenCh, errCh)
 	})
 
 	server := &http.Server{Handler: mux}
@@ -464,15 +443,7 @@ func startPKCEOAuthSession(
 			case err := <-errCh:
 				return "", err
 			case tok := <-tokenCh:
-				if cfg.UseIDToken {
-					if idTok, ok := tok.Extra("id_token").(string); ok && idTok != "" {
-						return idTok, nil
-					}
-				}
-				if tok.AccessToken == "" {
-					return "", errors.New("PKCE flow returned empty token")
-				}
-				return tok.AccessToken, nil
+				return tok, nil
 			}
 		},
 	}
@@ -487,6 +458,57 @@ func startPKCEOAuthSession(
 		FlowType:  "pkce",
 		ExpiresIn: expiresIn,
 	}, nil
+}
+
+func isTransientMgmError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch s.Code() {
+	case codes.Unavailable, codes.DeadlineExceeded, codes.Internal:
+		return true
+	default:
+		return false
+	}
+}
+
+func registerPeerWithRetry(ctx context.Context, sess *oauthSession, jwtToken string, sysInfo *system.Info, pubSSH []byte) (string, string, error) {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(time.Duration(attempt) * 500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return "", "", ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		regClient, err := newMgmRegClient(ctx, sess.host, sess.key, sess.tlsEnabled)
+		if err != nil {
+			lastErr = fmt.Errorf("connect management server for peer registration: %w", err)
+			if isTransientMgmError(err) {
+				continue
+			}
+			return "", "", lastErr
+		}
+		peerIP, fqdn, regErr := regClient.Register(uuid.Nil.String(), jwtToken, sysInfo, pubSSH)
+		_ = regClient.Close()
+		if regErr == nil {
+			return peerIP, fqdn, nil
+		}
+		lastErr = fmt.Errorf("register peer with management server: %w", regErr)
+		if !isTransientMgmError(regErr) {
+			return "", "", lastErr
+		}
+	}
+	return "", "", lastErr
 }
 
 // CompleteOAuthSession waits for browser authorization on the given session, registers the
@@ -518,15 +540,9 @@ func CompleteOAuthSession(ctx context.Context, sessionID, deviceName string) (*O
 	infoCtx := context.WithValue(ctx, system.DeviceNameCtxKey, deviceName)
 	sysInfo := system.GetInfo(infoCtx)
 
-	regClient, err := newMgmRegClient(ctx, sess.host, sess.key, sess.tlsEnabled)
+	peerIP, fqdn, err := registerPeerWithRetry(ctx, sess, jwtToken, sysInfo, pubSSH)
 	if err != nil {
-		return nil, fmt.Errorf("connect management server for peer registration: %w", err)
-	}
-	defer regClient.Close()
-
-	peerIP, fqdn, err := regClient.Register(uuid.Nil.String(), jwtToken, sysInfo, pubSSH)
-	if err != nil {
-		return nil, fmt.Errorf("register peer with management server: %w", err)
+		return nil, err
 	}
 
 	return &OAuthCompleteResult{

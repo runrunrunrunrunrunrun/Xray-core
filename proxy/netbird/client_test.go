@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	nbnet "github.com/netbirdio/netbird/client/net"
 	"github.com/xtls/xray-core/app/policy"
 	"github.com/xtls/xray-core/app/stats"
 	"github.com/xtls/xray-core/common"
@@ -526,6 +527,53 @@ func TestHandlerCloseCancelsInFlightStartAndStopsStarted(t *testing.T) {
 	}
 	if got := client2.stopCalls.Load(); got != 1 {
 		t.Fatalf("expected 1 Stop call when Start succeeded during Close, got %d", got)
+	}
+}
+
+func TestOutboundInterfaceRefCountAndOverride(t *testing.T) {
+	t.Cleanup(func() {
+		SetOutboundInterface("")
+		outboundIfaceMu.Lock()
+		handlerIfaceOrder = nil
+		handlerIfaceCounts = make(map[string]int)
+		syncOutboundInterfaceLocked()
+		outboundIfaceMu.Unlock()
+	})
+
+	acquireHandlerOutboundInterface("eth0")
+	if got := nbnet.GetExternalOutboundInterface(); got != "eth0" {
+		t.Fatalf("after eth0 acquire = %q, want eth0", got)
+	}
+
+	acquireHandlerOutboundInterface("eth0")
+	acquireHandlerOutboundInterface("wlan0")
+	if got := nbnet.GetExternalOutboundInterface(); got != "wlan0" {
+		t.Fatalf("after wlan0 acquire = %q, want wlan0", got)
+	}
+
+	SetOutboundInterface("Ethernet")
+	if got := nbnet.GetExternalOutboundInterface(); got != "Ethernet" {
+		t.Fatalf("after host override = %q, want Ethernet", got)
+	}
+
+	SetOutboundInterface("")
+	if got := nbnet.GetExternalOutboundInterface(); got != "wlan0" {
+		t.Fatalf("after clearing host override = %q, want wlan0", got)
+	}
+
+	releaseHandlerOutboundInterface("wlan0")
+	if got := nbnet.GetExternalOutboundInterface(); got != "eth0" {
+		t.Fatalf("after wlan0 release = %q, want eth0", got)
+	}
+
+	releaseHandlerOutboundInterface("eth0")
+	if got := nbnet.GetExternalOutboundInterface(); got != "eth0" {
+		t.Fatalf("after first eth0 release = %q, want eth0", got)
+	}
+
+	releaseHandlerOutboundInterface("eth0")
+	if got := nbnet.GetExternalOutboundInterface(); got != "" {
+		t.Fatalf("after final release = %q, want empty", got)
 	}
 }
 

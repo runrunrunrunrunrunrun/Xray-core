@@ -165,3 +165,5 @@ tool (
 )
 
 replace github.com/cloudflare/circl => codeberg.org/cunicu/circl v0.0.0-20230801113412-fec58fc7b5f6
+
+replace github.com/netbirdio/netbird => github.com/runrunrunrunrunrunrun/netbird v0.83.2-onexray.1

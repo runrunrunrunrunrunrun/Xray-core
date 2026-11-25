@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +29,7 @@ import (
 
 	mgm "github.com/netbirdio/netbird/shared/management/client"
 	mgmcommon "github.com/netbirdio/netbird/shared/management/client/common"
+	"github.com/netbirdio/netbird/util/embeddedroots"
 	"github.com/xtls/xray-core/common/log"
 )
 
@@ -56,6 +60,7 @@ type pkceAuthConfig struct {
 	UseIDToken            bool
 	DisablePromptLogin    bool
 	LoginFlag             mgmcommon.LoginFlag
+	LoginHint             string
 }
 
 type deviceCodeResponse struct {
@@ -76,6 +81,21 @@ type deviceTokenResponse struct {
 	ExpiresIn        int    `json:"expires_in"`
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
+}
+
+func newOAuthHTTPClient(timeout time.Duration) *http.Client {
+	certPool, err := x509.SystemCertPool()
+	if err != nil || certPool == nil {
+		certPool = embeddedroots.Get()
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSClientConfig = &tls.Config{
+		RootCAs: certPool,
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
 }
 
 func parseManagementURL(raw string) (host string, tlsEnabled bool, err error) {
@@ -145,17 +165,88 @@ func notifyOAuthURL(authURL, userCode string) {
 	fmt.Fprintln(os.Stderr, msg)
 }
 
+func validatePKCEConfig(cfg pkceAuthConfig) error {
+	if cfg.ClientID == "" || cfg.AuthorizationEndpoint == "" || cfg.TokenEndpoint == "" || len(cfg.RedirectURLs) == 0 {
+		return errors.New("incomplete PKCE authorization flow config from management server")
+	}
+	return nil
+}
+
+func validateDeviceAuthConfig(cfg deviceAuthConfig) error {
+	if cfg.ClientID == "" || cfg.DeviceAuthEndpoint == "" || cfg.TokenEndpoint == "" {
+		return errors.New("incomplete device authorization flow config from management server")
+	}
+	return nil
+}
+
+// validateTokenAudience mirrors NetBird client/internal/auth/util.go:validateTokenAudience.
+func validateTokenAudience(token, audience string) error {
+	if token == "" {
+		return errors.New("token received is empty")
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return errors.New("token is not a well-formed JWT")
+	}
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return err
+	}
+	var claims struct {
+		Audience any `json:"aud"`
+	}
+	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+		return err
+	}
+	if claims.Audience == nil {
+		return errors.New("required token field audience is absent")
+	}
+	switch aud := claims.Audience.(type) {
+	case string:
+		if aud == audience {
+			return nil
+		}
+	case []any:
+		for _, item := range aud {
+			if audStr, ok := item.(string); ok && audStr == audience {
+				return nil
+			}
+		}
+	}
+	return errors.New("invalid JWT token audience field")
+}
+
+func selectToken(accessToken, idToken string, useIDToken bool, audience string) (string, error) {
+	token := accessToken
+	if useIDToken {
+		token = idToken
+	}
+	if token == "" {
+		return "", errors.New("oauth flow returned empty token")
+	}
+	if audience != "" {
+		if err := validateTokenAudience(token, audience); err != nil {
+			return "", fmt.Errorf("validate token audience: %w", err)
+		}
+	}
+	return token, nil
+}
+
 func obtainOAuthToken(ctx context.Context, managementURL, existingPrivateKey string) (string, error) {
 	host, tlsEnabled, err := parseManagementURL(managementURL)
 	if err != nil {
 		return "", err
 	}
 
+	trimmedExisting := strings.TrimSpace(existingPrivateKey)
+	sessionExtend := trimmedExisting != ""
+
 	var key wgtypes.Key
-	if existingPrivateKey != "" {
-		key, err = wgtypes.ParseKey(existingPrivateKey)
+	if sessionExtend {
+		key, err = wgtypes.ParseKey(trimmedExisting)
 	}
-	if existingPrivateKey == "" || err != nil {
+	if !sessionExtend || err != nil {
+		sessionExtend = false
 		key, err = wgtypes.GeneratePrivateKey()
 		if err != nil {
 			return "", fmt.Errorf("generate temporary wireguard key: %w", err)
@@ -167,6 +258,28 @@ func obtainOAuthToken(ctx context.Context, managementURL, existingPrivateKey str
 		return "", fmt.Errorf("connect management server %s: %w", host, err)
 	}
 	defer mgmClient.Close()
+
+	// Official NetBird order: try PKCE Authorization Code Flow first, fall back to Device Code Flow.
+	pkceFlow, pkceErr := mgmClient.GetPKCEAuthorizationFlow(sessionExtend)
+	if pkceErr == nil && pkceFlow != nil && pkceFlow.GetProviderConfig() != nil {
+		p := pkceFlow.GetProviderConfig()
+		tok, flowErr := runPKCEAuthFlow(ctx, pkceAuthConfig{
+			ClientID:              p.GetClientID(),
+			ClientSecret:          p.GetClientSecret(), //nolint:staticcheck
+			Audience:              p.GetAudience(),
+			TokenEndpoint:         p.GetTokenEndpoint(),
+			AuthorizationEndpoint: p.GetAuthorizationEndpoint(),
+			Scope:                 p.GetScope(),
+			RedirectURLs:          p.GetRedirectURLs(),
+			UseIDToken:            p.GetUseIDToken(),
+			DisablePromptLogin:    p.GetDisablePromptLogin(),
+			LoginFlag:             mgmcommon.LoginFlag(p.GetLoginFlag()),
+		})
+		if flowErr == nil {
+			return tok, nil
+		}
+		pkceErr = flowErr
+	}
 
 	deviceFlow, deviceErr := mgmClient.GetDeviceAuthorizationFlow()
 	if deviceErr == nil && deviceFlow != nil && deviceFlow.GetProviderConfig() != nil {
@@ -182,44 +295,21 @@ func obtainOAuthToken(ctx context.Context, managementURL, existingPrivateKey str
 		}, nil)
 	}
 
-	if deviceErr != nil {
-		if s, ok := status.FromError(deviceErr); ok && s.Code() != codes.NotFound && s.Code() != codes.Unimplemented {
-			return "", fmt.Errorf("get device authorization flow: %w", deviceErr)
-		}
+	if s, ok := status.FromError(deviceErr); ok && (s.Code() == codes.NotFound || s.Code() == codes.Unimplemented) {
+		return "", fmt.Errorf("no SSO provider returned from management %s (pkce: %v; device: %w)", managementURL, pkceErr, deviceErr)
 	}
-
-	pkceFlow, pkceErr := mgmClient.GetPKCEAuthorizationFlow(false)
 	if pkceErr != nil {
-		if deviceErr != nil {
-			return "", fmt.Errorf("get oauth flow (device: %v; pkce: %w)", deviceErr, pkceErr)
-		}
-		return "", fmt.Errorf("get pkce authorization flow: %w", pkceErr)
+		return "", fmt.Errorf("get oauth flow (pkce: %v; device: %w)", pkceErr, deviceErr)
 	}
-	if pkceFlow == nil || pkceFlow.GetProviderConfig() == nil {
-		return "", errors.New("management server returned empty PKCE authorization flow config")
-	}
-
-	p := pkceFlow.GetProviderConfig()
-	return runPKCEAuthFlow(ctx, pkceAuthConfig{
-		ClientID:              p.GetClientID(),
-		ClientSecret:          p.GetClientSecret(), //nolint:staticcheck
-		Audience:              p.GetAudience(),
-		TokenEndpoint:         p.GetTokenEndpoint(),
-		AuthorizationEndpoint: p.GetAuthorizationEndpoint(),
-		Scope:                 p.GetScope(),
-		RedirectURLs:          p.GetRedirectURLs(),
-		UseIDToken:            p.GetUseIDToken(),
-		DisablePromptLogin:    p.GetDisablePromptLogin(),
-		LoginFlag:             mgmcommon.LoginFlag(p.GetLoginFlag()),
-	})
+	return "", fmt.Errorf("get device authorization flow: %w", deviceErr)
 }
 
 func runDeviceAuthFlow(ctx context.Context, cfg deviceAuthConfig, httpClient *http.Client) (string, error) {
-	if cfg.ClientID == "" || cfg.DeviceAuthEndpoint == "" || cfg.TokenEndpoint == "" {
-		return "", errors.New("incomplete device authorization flow config from management server")
+	if err := validateDeviceAuthConfig(cfg); err != nil {
+		return "", err
 	}
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 15 * time.Second}
+		httpClient = newOAuthHTTPClient(15 * time.Second)
 	}
 
 	scope := strings.TrimSpace(cfg.Scope)
@@ -317,14 +407,7 @@ func runDeviceAuthFlow(ctx context.Context, cfg deviceAuthConfig, httpClient *ht
 				}
 			}
 
-			token := tokResp.AccessToken
-			if cfg.UseIDToken && tokResp.IDToken != "" {
-				token = tokResp.IDToken
-			}
-			if token == "" {
-				return "", errors.New("device flow returned empty token")
-			}
-			return token, nil
+			return selectToken(tokResp.AccessToken, tokResp.IDToken, cfg.UseIDToken, cfg.Audience)
 		}
 	}
 }
@@ -364,25 +447,7 @@ func pollDeviceToken(ctx context.Context, httpClient *http.Client, cfg deviceAut
 	return tokResp, nil
 }
 
-func runPKCEAuthFlow(ctx context.Context, cfg pkceAuthConfig) (string, error) {
-	if cfg.ClientID == "" || cfg.AuthorizationEndpoint == "" || cfg.TokenEndpoint == "" || len(cfg.RedirectURLs) == 0 {
-		return "", errors.New("incomplete PKCE authorization flow config from management server")
-	}
-
-	ln, redirectURL, err := bindPKCERedirectListener(cfg.RedirectURLs)
-	if err != nil {
-		return "", err
-	}
-	defer ln.Close()
-
-	state, err := randomHexBytes(24)
-	if err != nil {
-		return "", fmt.Errorf("generate PKCE state: %w", err)
-	}
-	codeVerifier, err := randomBase64URLBytes(64)
-	if err != nil {
-		return "", fmt.Errorf("generate PKCE verifier: %w", err)
-	}
+func buildPKCEOAuthConfigAndURL(cfg pkceAuthConfig, redirectURL, state, codeVerifier string) (*oauth2.Config, string) {
 	sum := sha256.Sum256([]byte(codeVerifier))
 	codeChallenge := base64.RawURLEncoding.EncodeToString(sum[:])
 
@@ -417,64 +482,46 @@ func runPKCEAuthFlow(ctx context.Context, cfg pkceAuthConfig) (string, error) {
 			params = append(params, oauth2.SetAuthURLParam("max_age", "0"))
 		}
 	}
+	if cfg.LoginHint != "" {
+		params = append(params, oauth2.SetAuthURLParam("login_hint", cfg.LoginHint))
+	}
 
-	authURL := oauthCfg.AuthCodeURL(state, params...)
+	return oauthCfg, oauthCfg.AuthCodeURL(state, params...)
+}
+
+func runPKCEAuthFlow(ctx context.Context, cfg pkceAuthConfig) (string, error) {
+	if err := validatePKCEConfig(cfg); err != nil {
+		return "", err
+	}
+
+	ln, redirectURL, err := bindPKCERedirectListener(cfg.RedirectURLs)
+	if err != nil {
+		return "", err
+	}
+	defer ln.Close()
+
+	state, err := randomHexBytes(24)
+	if err != nil {
+		return "", fmt.Errorf("generate PKCE state: %w", err)
+	}
+	codeVerifier, err := randomHexBytes(32)
+	if err != nil {
+		return "", fmt.Errorf("generate PKCE verifier: %w", err)
+	}
+
+	oauthCfg, authURL := buildPKCEOAuthConfigAndURL(cfg, redirectURL, state, codeVerifier)
 	notifyOAuthURL(authURL, "")
 
 	waitCtx, cancel := context.WithTimeout(ctx, defaultOAuthTimeout)
 	defer cancel()
 
-	tokenCh := make(chan *oauth2.Token, 1)
+	tokenCh := make(chan string, 1)
 	errCh := make(chan error, 1)
+	httpClient := newOAuthHTTPClient(15 * time.Second)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
-		q := req.URL.Query()
-		if authErr := q.Get("error"); authErr != "" {
-			desc := q.Get("error_description")
-			if desc != "" {
-				authErr = desc
-			}
-			writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: "+authErr)
-			select {
-			case errCh <- fmt.Errorf("PKCE authorization error: %s", authErr):
-			default:
-			}
-			return
-		}
-		if subtle.ConstantTimeCompare([]byte(state), []byte(q.Get("state"))) == 0 {
-			writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: invalid state")
-			select {
-			case errCh <- errors.New("PKCE authorization failed: invalid state"):
-			default:
-			}
-			return
-		}
-		code := q.Get("code")
-		if code == "" {
-			writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: missing authorization code")
-			select {
-			case errCh <- errors.New("PKCE authorization failed: missing code"):
-			default:
-			}
-			return
-		}
-
-		tok, exchangeErr := oauthCfg.Exchange(req.Context(), code, oauth2.SetAuthURLParam("code_verifier", codeVerifier))
-		if exchangeErr != nil {
-			writePKCEResponse(w, http.StatusBadGateway, "NetBird token exchange failed: "+exchangeErr.Error())
-			select {
-			case errCh <- fmt.Errorf("PKCE token exchange: %w", exchangeErr):
-			default:
-			}
-			return
-		}
-
-		writePKCEResponse(w, http.StatusOK, "NetBird login successful. You can close this window.")
-		select {
-		case tokenCh <- tok:
-		default:
-		}
+		handlePKCECallback(w, req, state, codeVerifier, cfg, oauthCfg, httpClient, tokenCh, errCh)
 	})
 
 	server := &http.Server{Handler: mux}
@@ -498,19 +545,82 @@ func runPKCEAuthFlow(ctx context.Context, cfg pkceAuthConfig) (string, error) {
 	case err := <-errCh:
 		return "", err
 	case tok := <-tokenCh:
-		if cfg.UseIDToken {
-			if idTok, ok := tok.Extra("id_token").(string); ok && idTok != "" {
-				return idTok, nil
-			}
+		return tok, nil
+	}
+}
+
+func handlePKCECallback(
+	w http.ResponseWriter,
+	req *http.Request,
+	state, codeVerifier string,
+	cfg pkceAuthConfig,
+	oauthCfg *oauth2.Config,
+	httpClient *http.Client,
+	tokenCh chan<- string,
+	errCh chan<- error,
+) {
+	q := req.URL.Query()
+	if authErr := q.Get("error"); authErr != "" {
+		desc := q.Get("error_description")
+		if desc != "" {
+			authErr = desc
 		}
-		if tok.AccessToken == "" {
-			return "", errors.New("PKCE flow returned empty token")
+		writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: "+authErr)
+		select {
+		case errCh <- fmt.Errorf("PKCE authorization error: %s", authErr):
+		default:
 		}
-		return tok.AccessToken, nil
+		return
+	}
+	if subtle.ConstantTimeCompare([]byte(state), []byte(q.Get("state"))) == 0 {
+		writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: invalid state")
+		select {
+		case errCh <- errors.New("PKCE authorization failed: invalid state"):
+		default:
+		}
+		return
+	}
+	code := q.Get("code")
+	if code == "" {
+		writePKCEResponse(w, http.StatusBadRequest, "NetBird login failed: missing authorization code")
+		select {
+		case errCh <- errors.New("PKCE authorization failed: missing code"):
+		default:
+		}
+		return
+	}
+
+	exchangeCtx := context.WithValue(req.Context(), oauth2.HTTPClient, httpClient)
+	tok, exchangeErr := oauthCfg.Exchange(exchangeCtx, code, oauth2.SetAuthURLParam("code_verifier", codeVerifier))
+	if exchangeErr != nil {
+		writePKCEResponse(w, http.StatusBadGateway, "NetBird token exchange failed: "+exchangeErr.Error())
+		select {
+		case errCh <- fmt.Errorf("PKCE token exchange: %w", exchangeErr):
+		default:
+		}
+		return
+	}
+
+	idTok, _ := tok.Extra("id_token").(string)
+	selected, selErr := selectToken(tok.AccessToken, idTok, cfg.UseIDToken, cfg.Audience)
+	if selErr != nil {
+		writePKCEResponse(w, http.StatusBadGateway, "NetBird token validation failed: "+selErr.Error())
+		select {
+		case errCh <- selErr:
+		default:
+		}
+		return
+	}
+
+	writePKCEResponse(w, http.StatusOK, "NetBird login successful. You can close this window.")
+	select {
+	case tokenCh <- selected:
+	default:
 	}
 }
 
 func bindPKCERedirectListener(redirectURLs []string) (net.Listener, string, error) {
+	excludedRanges := getSystemExcludedPortRanges()
 	var lastErr error
 	for _, raw := range redirectURLs {
 		u, err := url.Parse(raw)
@@ -530,7 +640,19 @@ func bindPKCERedirectListener(redirectURLs []string) (net.Listener, string, erro
 		if port == "" {
 			continue
 		}
-		ln, err := net.Listen("tcp", ":"+port)
+		if p, convErr := strconv.Atoi(port); convErr == nil && p > 0 && isPortExcluded(p, excludedRanges) {
+			lastErr = fmt.Errorf("redirect port %d is excluded by Windows", p)
+			continue
+		}
+
+		listenHost := ""
+		switch strings.ToLower(u.Hostname()) {
+		case "127.0.0.1", "localhost":
+			listenHost = "127.0.0.1"
+		case "::1":
+			listenHost = "::1"
+		}
+		ln, err := net.Listen("tcp", net.JoinHostPort(listenHost, port))
 		if err != nil {
 			lastErr = err
 			continue
@@ -554,6 +676,7 @@ func bindPKCERedirectListener(redirectURLs []string) (net.Listener, string, erro
 
 func writePKCEResponse(w http.ResponseWriter, statusCode int, message string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(statusCode)
 	_, _ = fmt.Fprintf(w, "<!doctype html><html><body><h3>%s</h3></body></html>", html.EscapeString(message))
 }
@@ -564,12 +687,4 @@ func randomHexBytes(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
-}
-
-func randomBase64URLBytes(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b), nil
 }

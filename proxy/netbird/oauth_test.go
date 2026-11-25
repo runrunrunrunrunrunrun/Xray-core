@@ -2,6 +2,7 @@ package netbird
 
 import (
 	"context"
+	"encoding/base64"
 	stderrors "errors"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -318,5 +320,69 @@ func TestHandlerOAuthLifecycle(t *testing.T) {
 	}
 	if time.Since(startClose) > time.Second {
 		t.Fatalf("Close took too long: %v", time.Since(startClose))
+	}
+}
+
+func makeTestJWT(claimsJSON string) string {
+	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	pay := base64.RawURLEncoding.EncodeToString([]byte(claimsJSON))
+	return hdr + "." + pay + ".sig"
+}
+
+func TestValidateTokenAudience(t *testing.T) {
+	tests := []struct {
+		name    string
+		token   string
+		aud     string
+		wantErr bool
+	}{
+		{"string aud match", makeTestJWT(`{"aud":"https://api.netbird.io"}`), "https://api.netbird.io", false},
+		{"array aud match", makeTestJWT(`{"aud":["other","https://api.netbird.io"]}`), "https://api.netbird.io", false},
+		{"aud mismatch", makeTestJWT(`{"aud":"https://wrong.example"}`), "https://api.netbird.io", true},
+		{"missing aud", makeTestJWT(`{"sub":"123"}`), "https://api.netbird.io", true},
+		{"malformed jwt", "not-a-jwt", "https://api.netbird.io", true},
+		{"empty token", "", "https://api.netbird.io", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTokenAudience(tc.token, tc.aud)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateTokenAudience() err=%v, wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestParseExcludedPortRanges(t *testing.T) {
+	englishOutput := `
+Protocol tcp Port Exclusion Ranges
+
+Start Port    End Port
+----------    --------
+     49675       49774
+     50000       50059     *
+     53000       53099
+
+* - Administered port exclusions.
+`
+	chineseOutput := `
+协议 tcp 端口排除范围
+
+开始端口    结束端口
+----------    --------
+     49664       49763
+     53000       53099
+`
+	wantEN := []excludedPortRange{{49675, 49774}, {50000, 50059}, {53000, 53099}}
+	if got := parseExcludedPortRanges(englishOutput); !reflect.DeepEqual(got, wantEN) {
+		t.Fatalf("English netsh parse = %+v, want %+v", got, wantEN)
+	}
+	wantZH := []excludedPortRange{{49664, 49763}, {53000, 53099}}
+	if got := parseExcludedPortRanges(chineseOutput); !reflect.DeepEqual(got, wantZH) {
+		t.Fatalf("Chinese netsh parse = %+v, want %+v", got, wantZH)
+	}
+	if !isPortExcluded(50000, wantEN) || isPortExcluded(54000, wantEN) {
+		t.Fatal("isPortExcluded returned unexpected result")
 	}
 }

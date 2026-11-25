@@ -67,6 +67,7 @@ type Handler struct {
 	registryKey     string
 
 	oauthMode     bool
+	outboundIface string
 	baseOpts      embed.Options
 	managementURL string
 	configPath    string
@@ -104,8 +105,12 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 	p := v.GetFeature(policy.ManagerType()).(policy.Manager)
 
 	var tag string
+	var outboundIface string
 	var uplinkCounter stats.Counter
 	var downlinkCounter stats.Counter
+	if ss, ok := session.StreamSettingsFromContext(ctx).(*internet.MemoryStreamConfig); ok && ss != nil && ss.SocketSettings != nil {
+		outboundIface = strings.TrimSpace(ss.SocketSettings.Interface)
+	}
 	if fh := session.FullHandlerFromContext(ctx); fh != nil {
 		tag = fh.Tag()
 		if len(tag) > 0 && p.ForSystem().Stats.OutboundUplink {
@@ -166,13 +171,17 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		startupTimeout = defaultStartupTimeout
 	}
 
+	acquireHandlerOutboundInterface(outboundIface)
+
 	oauthMode := conf.SetupKey == "" && conf.JwtToken == "" && conf.PrivateKey == ""
 	if !oauthMode {
 		client, err := defaultNewClient(opts)
 		if err != nil {
+			releaseHandlerOutboundInterface(outboundIface)
 			return nil, errors.New("failed to create netbird client").Base(err)
 		}
 		h := newHandlerWithTag(tag, p, client, startupTimeout, uplinkCounter, downlinkCounter, false)
+		h.outboundIface = outboundIface
 		h.baseOpts = opts
 		h.managementURL = conf.ManagementUrl
 		h.mu.Lock()
@@ -181,7 +190,12 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		return h, nil
 	}
 
-	return newOAuthHandlerWithTag(tag, p, opts, conf.ManagementUrl, conf.ConfigPath, startupTimeout, defaultOAuthTimeout, uplinkCounter, downlinkCounter, defaultNewClient, obtainOAuthToken, true), nil
+	h := newOAuthHandlerWithTag(tag, p, opts, conf.ManagementUrl, conf.ConfigPath, startupTimeout, defaultOAuthTimeout, uplinkCounter, downlinkCounter, defaultNewClient, obtainOAuthToken, false)
+	h.outboundIface = outboundIface
+	h.mu.Lock()
+	h.triggerStartLocked()
+	h.mu.Unlock()
+	return h, nil
 }
 
 func newHandler(p policy.Manager, client netbirdClient, startupTimeout time.Duration, uplinkCounter, downlinkCounter stats.Counter, autoStart bool) *Handler {
@@ -606,9 +620,11 @@ func (h *Handler) Close() error {
 	client := h.client
 	cancel := h.startCancel
 	done := h.startDone
+	outboundIface := h.outboundIface
 	h.state = stateClosed
 	h.startCancel = nil
 	h.mu.Unlock()
+	defer releaseHandlerOutboundInterface(outboundIface)
 
 	if cancel != nil {
 		cancel()
