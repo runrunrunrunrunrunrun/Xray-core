@@ -330,6 +330,9 @@ func (h *Handler) GetOutbound() proxy.Outbound {
 
 // Start implements common.Runnable.
 func (h *Handler) Start() error {
+	if r, ok := h.proxy.(common.Runnable); ok {
+		return r.Start()
+	}
 	return nil
 }
 

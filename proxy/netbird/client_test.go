@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/netbirdio/netbird/client/embed"
 	nbnet "github.com/netbirdio/netbird/client/net"
 	"github.com/xtls/xray-core/app/policy"
 	"github.com/xtls/xray-core/app/stats"
@@ -574,6 +575,82 @@ func TestOutboundInterfaceRefCountAndOverride(t *testing.T) {
 	releaseHandlerOutboundInterface("eth0")
 	if got := nbnet.GetExternalOutboundInterface(); got != "" {
 		t.Fatalf("after final release = %q, want empty", got)
+	}
+}
+
+func TestHandlerDoesNotStartBeforeStartIsCalled(t *testing.T) {
+	pm := newTestPolicyManager(t)
+	var factoryCalled atomic.Bool
+	var startCalled atomic.Bool
+
+	h := &Handler{
+		policyManager:  pm,
+		startupTimeout: time.Second,
+		outboundIface:  "eth-deferred",
+		baseOpts:       embed.Options{SetupKey: "one-off-key"},
+		newClientFn: func(opts embed.Options) (netbirdClient, error) {
+			factoryCalled.Store(true)
+			return &fakeNetbirdClient{
+				startFn: func(context.Context) error {
+					startCalled.Store(true)
+					return nil
+				},
+			}, nil
+		},
+		state: stateIdle,
+	}
+	h.registerHandler("nb-deferred-test")
+
+	if factoryCalled.Load() || startCalled.Load() {
+		t.Fatal("expected no client creation/start before Start()")
+	}
+	if got := nbnet.GetExternalOutboundInterface(); got != "" {
+		t.Fatalf("expected empty outbound interface before Start(), got %q", got)
+	}
+
+	// Simulate TestXray validation path: Close without Start must be instant and inert.
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if factoryCalled.Load() || startCalled.Load() {
+		t.Fatal("expected Close without Start not to touch NetBird")
+	}
+
+	// Now verify Start() launches the client and acquires/releases interface.
+	h2 := &Handler{
+		policyManager:  pm,
+		startupTimeout: time.Second,
+		outboundIface:  "eth-deferred",
+		baseOpts:       embed.Options{SetupKey: "real-key"},
+		newClientFn: func(opts embed.Options) (netbirdClient, error) {
+			factoryCalled.Store(true)
+			return &fakeNetbirdClient{
+				startFn: func(context.Context) error {
+					startCalled.Store(true)
+					return nil
+				},
+			}, nil
+		},
+		state: stateIdle,
+	}
+	h2.registerHandler("nb-deferred-test-2")
+	if err := h2.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	if got := nbnet.GetExternalOutboundInterface(); got != "eth-deferred" {
+		t.Fatalf("expected eth-deferred after Start(), got %q", got)
+	}
+	if err := h2.ensureStarted(context.Background()); err != nil {
+		t.Fatalf("ensureStarted() failed: %v", err)
+	}
+	if !factoryCalled.Load() || !startCalled.Load() {
+		t.Fatal("expected factory and Start to be invoked after Start()")
+	}
+	if err := h2.Close(); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+	if got := nbnet.GetExternalOutboundInterface(); got != "" {
+		t.Fatalf("expected empty outbound interface after Close(), got %q", got)
 	}
 }
 

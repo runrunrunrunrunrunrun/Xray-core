@@ -227,14 +227,18 @@ func (s clientState) String() string {
 	}
 }
 
-func isLoginExpiredErr(err error) bool {
-	if err == nil {
+func isLoginExpiredErr(err error, hasSetupKey bool) bool {
+	if err == nil || hasSetupKey {
 		return false
 	}
 	lower := strings.ToLower(err.Error())
 	return strings.Contains(lower, "peer login has expired") ||
 		strings.Contains(lower, "login required") ||
-		strings.Contains(lower, "permissiondenied")
+		strings.Contains(lower, "needs login") ||
+		strings.Contains(lower, "sso login") ||
+		strings.Contains(lower, "session has expired") ||
+		strings.Contains(lower, "token has expired") ||
+		strings.Contains(lower, "token is expired")
 }
 
 // StatusSnapshot returns the current NetBird connection snapshot for this handler.
@@ -245,7 +249,7 @@ func (h *Handler) StatusSnapshot() StatusSnapshot {
 		State:         h.state.String(),
 		DeviceName:    h.baseOpts.DeviceName,
 		ManagementURL: h.managementURL,
-		LoginExpired:  isLoginExpiredErr(h.lastStartErr),
+		LoginExpired:  isLoginExpiredErr(h.lastStartErr, h.baseOpts.SetupKey != ""),
 	}
 	if snap.Tag == "" {
 		snap.Tag = "netbird"

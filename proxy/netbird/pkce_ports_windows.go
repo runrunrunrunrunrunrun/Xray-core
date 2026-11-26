@@ -2,13 +2,8 @@
 
 package netbird
 
-import "os/exec"
-
+// Excluded Windows ports are detected directly when net.Listen fails with WSAEACCES,
+// avoiding spawning netsh.exe from inside libXray.dll in the GUI process.
 func getSystemExcludedPortRanges() []excludedPortRange {
-	cmd := exec.Command("netsh", "interface", "ipv4", "show", "excludedportrange", "protocol=tcp")
-	output, err := cmd.Output()
-	if err != nil {
-		return nil
-	}
-	return parseExcludedPortRanges(string(output))
+	return nil
 }

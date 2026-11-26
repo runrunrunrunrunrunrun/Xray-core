@@ -80,4 +80,22 @@ func TestHandlerStatusSnapshotAndExpvar(t *testing.T) {
 	if !expSnap.LoginExpired {
 		t.Fatalf("expected LoginExpired=true, got %+v", expSnap)
 	}
+
+	// Verify SetupKey PermissionDenied preserves LastError without false LoginExpired.
+	hSetupErr := newHandlerWithTag("nb-setup-err-test", pm, &fakeNetbirdClient{
+		startFn: func(context.Context) error {
+			return stderrors.New("login: rpc error: code = PermissionDenied desc = setup key is invalid or already used")
+		},
+	}, time.Second, nil, nil, false)
+	hSetupErr.baseOpts.SetupKey = "test-setup-key"
+	defer hSetupErr.Close()
+
+	_ = hSetupErr.ensureStarted(context.Background())
+	setupSnap := hSetupErr.StatusSnapshot()
+	if setupSnap.LoginExpired {
+		t.Fatalf("expected LoginExpired=false for SetupKey error, got %+v", setupSnap)
+	}
+	if setupSnap.LastError == "" {
+		t.Fatal("expected LastError to be preserved for SetupKey error")
+	}
 }

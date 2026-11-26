@@ -68,6 +68,7 @@ type Handler struct {
 
 	oauthMode     bool
 	outboundIface string
+	ifaceAcquired bool
 	baseOpts      embed.Options
 	managementURL string
 	configPath    string
@@ -171,31 +172,42 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		startupTimeout = defaultStartupTimeout
 	}
 
-	acquireHandlerOutboundInterface(outboundIface)
-
 	oauthMode := conf.SetupKey == "" && conf.JwtToken == "" && conf.PrivateKey == ""
-	if !oauthMode {
-		client, err := defaultNewClient(opts)
-		if err != nil {
-			releaseHandlerOutboundInterface(outboundIface)
-			return nil, errors.New("failed to create netbird client").Base(err)
-		}
-		h := newHandlerWithTag(tag, p, client, startupTimeout, uplinkCounter, downlinkCounter, false)
-		h.outboundIface = outboundIface
-		h.baseOpts = opts
-		h.managementURL = conf.ManagementUrl
-		h.mu.Lock()
-		h.triggerStartLocked()
-		h.mu.Unlock()
-		return h, nil
+	h := &Handler{
+		policyManager:   p,
+		startupTimeout:  startupTimeout,
+		oauthTimeout:    defaultOAuthTimeout,
+		uplinkCounter:   uplinkCounter,
+		downlinkCounter: downlinkCounter,
+		oauthMode:       oauthMode,
+		outboundIface:   outboundIface,
+		baseOpts:        opts,
+		managementURL:   conf.ManagementUrl,
+		configPath:      conf.ConfigPath,
+		newClientFn:     defaultNewClient,
+		oauthLoginFn:    obtainOAuthToken,
+		state:           stateIdle,
 	}
-
-	h := newOAuthHandlerWithTag(tag, p, opts, conf.ManagementUrl, conf.ConfigPath, startupTimeout, defaultOAuthTimeout, uplinkCounter, downlinkCounter, defaultNewClient, obtainOAuthToken, false)
-	h.outboundIface = outboundIface
-	h.mu.Lock()
-	h.triggerStartLocked()
-	h.mu.Unlock()
+	h.registerHandler(tag)
 	return h, nil
+}
+
+// Start implements common.Runnable and begins background NetBird startup.
+func (h *Handler) Start() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.state == stateIdle {
+		h.acquireOutboundInterfaceLocked()
+		h.triggerStartLocked()
+	}
+	return nil
+}
+
+func (h *Handler) acquireOutboundInterfaceLocked() {
+	if h.outboundIface != "" && !h.ifaceAcquired {
+		acquireHandlerOutboundInterface(h.outboundIface)
+		h.ifaceAcquired = true
+	}
 }
 
 func newHandler(p policy.Manager, client netbirdClient, startupTimeout time.Duration, uplinkCounter, downlinkCounter stats.Counter, autoStart bool) *Handler {
@@ -351,10 +363,26 @@ func (h *Handler) triggerStartLocked() {
 
 func (h *Handler) startClient(startCtx context.Context) (netbirdClient, error) {
 	if !h.oauthMode {
-		if err := h.client.Start(startCtx); err != nil {
+		h.mu.Lock()
+		client := h.client
+		factory := h.newClientFn
+		if factory == nil {
+			factory = defaultNewClient
+		}
+		opts := h.baseOpts
+		h.mu.Unlock()
+
+		if client == nil {
+			var err error
+			client, err = factory(opts)
+			if err != nil {
+				return nil, errors.New("failed to create netbird client").Base(err)
+			}
+		}
+		if err := client.Start(startCtx); err != nil {
 			return nil, err
 		}
-		return h.client, nil
+		return client, nil
 	}
 
 	existingKey := readPrivateKeyFromConfig(h.configPath)
@@ -415,6 +443,7 @@ func (h *Handler) ensureStarted(ctx context.Context) error {
 		h.mu.Unlock()
 		return errors.New("netbird client closed")
 	case stateIdle:
+		h.acquireOutboundInterfaceLocked()
 		h.triggerStartLocked()
 	}
 	done := h.startDone
@@ -620,7 +649,11 @@ func (h *Handler) Close() error {
 	client := h.client
 	cancel := h.startCancel
 	done := h.startDone
-	outboundIface := h.outboundIface
+	outboundIface := ""
+	if h.ifaceAcquired {
+		outboundIface = h.outboundIface
+		h.ifaceAcquired = false
+	}
 	h.state = stateClosed
 	h.startCancel = nil
 	h.mu.Unlock()

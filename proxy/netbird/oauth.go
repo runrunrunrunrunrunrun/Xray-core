@@ -645,14 +645,27 @@ func bindPKCERedirectListener(redirectURLs []string) (net.Listener, string, erro
 			continue
 		}
 
-		listenHost := ""
+		var addrs []string
 		switch strings.ToLower(u.Hostname()) {
-		case "127.0.0.1", "localhost":
-			listenHost = "127.0.0.1"
+		case "127.0.0.1":
+			addrs = []string{net.JoinHostPort("127.0.0.1", port)}
 		case "::1":
-			listenHost = "::1"
+			addrs = []string{net.JoinHostPort("::1", port)}
+		case "localhost", "":
+			addrs = []string{
+				net.JoinHostPort("", port),
+				net.JoinHostPort("127.0.0.1", port),
+			}
+		default:
+			addrs = []string{net.JoinHostPort("", port)}
 		}
-		ln, err := net.Listen("tcp", net.JoinHostPort(listenHost, port))
+		var ln net.Listener
+		for _, listenAddr := range addrs {
+			ln, err = net.Listen("tcp", listenAddr)
+			if err == nil {
+				break
+			}
+		}
 		if err != nil {
 			lastErr = err
 			continue
