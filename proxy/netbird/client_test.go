@@ -34,8 +34,10 @@ type fakeNetbirdClient struct {
 	listenUDPFn      func(address string) (net.PacketConn, error)
 	statusSnapshotFn func() (*StatusDetail, error)
 	routingTableFn   func() (embed.RoutingTable, error)
-	matchDNSDomainFn func(domain string) bool
-	lookupIPFn       func(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error)
+	matchDNSDomainFn  func(domain string) bool
+	lookupIPFn        func(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error)
+	hasDefaultDNSFn   func() bool
+	lookupDefaultIPFn func(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error)
 
 	startCalls atomic.Int32
 	stopCalls  atomic.Int32
@@ -67,6 +69,20 @@ func (f *fakeNetbirdClient) LookupIP(ctx context.Context, domain string, ipv4, i
 		return f.lookupIPFn(ctx, domain, ipv4, ipv6)
 	}
 	return nil, 0, nil
+}
+
+func (f *fakeNetbirdClient) HasDefaultDNS() bool {
+	if f.hasDefaultDNSFn != nil {
+		return f.hasDefaultDNSFn()
+	}
+	return false
+}
+
+func (f *fakeNetbirdClient) LookupDefaultIP(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error) {
+	if f.lookupDefaultIPFn != nil {
+		return f.lookupDefaultIPFn(ctx, domain, ipv4, ipv6)
+	}
+	return nil, 0, embed.ErrDNSFallthrough
 }
 
 func (f *fakeNetbirdClient) Start(ctx context.Context) error {

@@ -3,6 +3,7 @@ package netbird
 import (
 	"bytes"
 	"context"
+	stderrors "errors"
 	"io"
 	"net/netip"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/xtls/xray-core/common/signal"
 	"github.com/xtls/xray-core/common/task"
 	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/policy"
 	"github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
@@ -46,6 +48,8 @@ type netbirdClient interface {
 	RoutingTable() (embed.RoutingTable, error)
 	MatchDNSDomain(domain string) bool
 	LookupIP(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error)
+	HasDefaultDNS() bool
+	LookupDefaultIP(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error)
 }
 
 type (
@@ -65,6 +69,7 @@ const (
 // Handler implements proxy.Outbound for the NetBird embedded userspace client.
 type Handler struct {
 	policyManager   policy.Manager
+	dnsClient       dns.Client
 	startupTimeout  time.Duration
 	oauthTimeout    time.Duration
 	uplinkCounter   stats.Counter
@@ -115,6 +120,10 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 
 	v := core.MustFromContext(ctx)
 	p := v.GetFeature(policy.ManagerType()).(policy.Manager)
+	var dnsClient dns.Client
+	if f := v.GetFeature(dns.ClientType()); f != nil {
+		dnsClient, _ = f.(dns.Client)
+	}
 
 	var tag string
 	var outboundIface string
@@ -187,6 +196,7 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 	oauthMode := conf.SetupKey == "" && conf.JwtToken == "" && conf.PrivateKey == ""
 	h := &Handler{
 		policyManager:   p,
+		dnsClient:       dnsClient,
 		startupTimeout:  startupTimeout,
 		oauthTimeout:    defaultOAuthTimeout,
 		uplinkCounter:   uplinkCounter,
@@ -576,12 +586,20 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		return errors.New("netbird client not initialized")
 	}
 
+	target, err := h.resolveTargetDestination(dialCtx, client, ob.Target)
+	if err != nil {
+		if dialCancel != nil {
+			dialCancel()
+		}
+		return errors.New("failed to resolve target domain").Base(err)
+	}
+
 	var reader buf.Reader
 	var writer buf.Writer
 
-	switch ob.Target.Network {
+	switch target.Network {
 	case net.Network_TCP:
-		conn, err := client.DialContext(dialCtx, "tcp", ob.Target.NetAddr())
+		conn, err := client.DialContext(dialCtx, "tcp", target.NetAddr())
 		if dialCancel != nil {
 			dialCancel()
 		}
@@ -600,7 +618,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		writer = buf.NewWriter(conn)
 
 	case net.Network_UDP:
-		if ob.Target.Address.Family().IsIPv4() {
+		if target.Address.Family().IsIPv4() {
 			if dialCancel != nil {
 				dialCancel()
 			}
@@ -621,8 +639,8 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 			c := &udpConnClient{
 				PacketConn: pktConn,
 				Dest: &net.UDPAddr{
-					IP:   ob.Target.Address.IP(),
-					Port: int(ob.Target.Port),
+					IP:   target.Address.IP(),
+					Port: int(target.Port),
 				},
 			}
 			reader = c
@@ -630,7 +648,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		} else {
 			// Domain and IPv6 UDP targets use DialContext so NetBird's netstack DNS
 			// resolves domain names and gVisor selects the matching IP protocol stack.
-			conn, err := client.DialContext(dialCtx, "udp", ob.Target.NetAddr())
+			conn, err := client.DialContext(dialCtx, "udp", target.NetAddr())
 			if dialCancel != nil {
 				dialCancel()
 			}
@@ -638,7 +656,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 				return errors.New("failed to create UDP connection").Base(err)
 			}
 			defer conn.Close()
-			remoteDest := ob.Target
+			remoteDest := target
 			if udpAddr, ok := conn.RemoteAddr().(*net.UDPAddr); ok && udpAddr != nil {
 				remoteDest = net.UDPDestination(net.IPAddress(udpAddr.IP), net.Port(udpAddr.Port))
 			}
@@ -682,6 +700,55 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	}
 
 	return nil
+}
+
+func (h *Handler) resolveTargetDestination(ctx context.Context, client netbirdClient, target net.Destination) (net.Destination, error) {
+	if !target.Address.Family().IsDomain() {
+		return target, nil
+	}
+	domain := target.Address.Domain()
+	opt := dns.IPOption{
+		IPv4Enable: true,
+		IPv6Enable: !h.baseOpts.DisableIPv6,
+		FakeEnable: false,
+	}
+
+	if h.MatchDomain(domain) {
+		ips, _, err := h.LookupIP(ctx, domain, opt)
+		if err == nil && len(ips) > 0 {
+			target.Address = net.IPAddress(pickPreferredIP(ips))
+			return target, nil
+		}
+		if err != nil && !stderrors.Is(err, dns.ErrDynamicFallthrough) && !stderrors.Is(err, dns.ErrEmptyResponse) {
+			return target, err
+		}
+	}
+
+	if client != nil && (client.HasDefaultDNS() || len(h.routeSnap.Load().searchDomains) > 0) {
+		ips, _, matched, err := h.LookupFallbackIP(ctx, domain, opt)
+		if matched && err == nil && len(ips) > 0 {
+			target.Address = net.IPAddress(pickPreferredIP(ips))
+			return target, nil
+		}
+	}
+
+	if h.dnsClient != nil {
+		if ips, _, err := h.dnsClient.LookupIP(domain, opt); err == nil && len(ips) > 0 {
+			target.Address = net.IPAddress(pickPreferredIP(ips))
+			return target, nil
+		}
+	}
+
+	return target, nil
+}
+
+func pickPreferredIP(ips []net.IP) net.IP {
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			return v4
+		}
+	}
+	return ips[0]
 }
 
 // Close implements common.Closable.

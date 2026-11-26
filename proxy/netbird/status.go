@@ -67,12 +67,14 @@ type StatusSnapshot struct {
 	EnableExitNode        bool                  `json:"enableExitNode"`
 	ExitNodeAvailable     bool                  `json:"exitNodeAvailable"`
 	ExitNodeActive        bool                  `json:"exitNodeActive"`
+	HasDefaultDNS         bool                  `json:"hasDefaultDns,omitempty"`
 	PeersTotal            int                   `json:"peersTotal"`
 	PeersConnected        int                   `json:"peersConnected"`
 	Relays                []RelayStatusSnapshot `json:"relays,omitempty"`
 	Peers                 []PeerStatusSnapshot  `json:"peers,omitempty"`
 	Routes                []string              `json:"routes,omitempty"`
 	DNSDomains            []string              `json:"dnsDomains,omitempty"`
+	SearchDomains         []string              `json:"searchDomains,omitempty"`
 	LoginExpired          bool                  `json:"loginExpired"`
 	LastError             string                `json:"lastError,omitempty"`
 }
@@ -302,8 +304,12 @@ func (h *Handler) StatusSnapshot() StatusSnapshot {
 	if routeSnap := h.routeSnap.Load(); routeSnap != nil {
 		snap.ExitNodeAvailable = len(routeSnap.exitNodeIDs) > 0
 		snap.ExitNodeActive = h.enableExitNode && (routeSnap.exitNodeV4 || routeSnap.exitNodeV6)
+		snap.HasDefaultDNS = routeSnap.hasDefaultDNS
 		if len(routeSnap.dnsDomains) > 0 {
 			snap.DNSDomains = append([]string(nil), routeSnap.dnsDomains...)
+		}
+		if len(routeSnap.searchDomains) > 0 {
+			snap.SearchDomains = append([]string(nil), routeSnap.searchDomains...)
 		}
 		if len(routeSnap.allRoutes) > 0 {
 			seen := make(map[string]struct{}, len(snap.Routes)+len(routeSnap.allRoutes))

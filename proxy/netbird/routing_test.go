@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/netbirdio/netbird/client/embed"
+	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
 	"google.golang.org/protobuf/proto"
@@ -140,6 +141,30 @@ func TestHandlerRoutingMatcherAndDNSLookup(t *testing.T) {
 		t.Fatalf("expected matched=true and ErrEmptyResponse, got matched=%v err=%v", matched, err)
 	}
 
+	// Fallthrough & RCodeError mapping on dynamic resolver.
+	client.matchDNSDomainFn = func(domain string) bool {
+		return domain == "fall.example" || domain == "missing.netbird.selfhosted" || domain == "nas.netbird.selfhosted" || domain == "api.corp.example" || domain == "nodata.netbird.selfhosted"
+	}
+	origLookup := client.lookupIPFn
+	client.lookupIPFn = func(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error) {
+		switch domain {
+		case "fall.example":
+			return nil, 0, embed.ErrDNSFallthrough
+		case "missing.netbird.selfhosted":
+			return nil, 0, &embed.DNSRcodeError{Domain: domain, Rcode: 3}
+		default:
+			return origLookup(ctx, domain, ipv4, ipv6)
+		}
+	}
+	_, _, matched, err = dns.LookupDynamic(context.Background(), "fall.example", dns.IPOption{IPv4Enable: true})
+	if matched || err != nil {
+		t.Fatalf("expected matched=false and err=nil on fallthrough, got matched=%v err=%v", matched, err)
+	}
+	_, _, matched, err = dns.LookupDynamic(context.Background(), "missing.netbird.selfhosted", dns.IPOption{IPv4Enable: true})
+	if !matched || dns.RCodeFromError(err) != 3 {
+		t.Fatalf("expected matched=true and RCode=3, got matched=%v err=%v", matched, err)
+	}
+
 	// Disabled exit node must return false even if ExitNodeV4 is true in table.
 	h.enableExitNode = false
 	h.refreshRouteSnapshotFromClient(client)
@@ -154,5 +179,17 @@ func TestHandlerRoutingMatcherAndDNSLookup(t *testing.T) {
 	}
 	if len(snap.DNSDomains) != 2 {
 		t.Fatalf("unexpected DNS domains in snapshot: %+v", snap.DNSDomains)
+	}
+
+	// Sniffed/proxy domain targets resolve to overlay IP before dialing client.DialContext.
+	var dialedDest string
+	client.dialContextFn = func(_ context.Context, _ string, address string) (stdnet.Conn, error) {
+		dialedDest = address
+		return nil, stderrors.New("stop after capture")
+	}
+	link, _ := newPipeLink(t)
+	_ = h.Process(newOutboundCtx(net.TCPDestination(net.DomainAddress("nas.netbird.selfhosted"), 443)), link, nil)
+	if dialedDest != "100.77.0.10:443" {
+		t.Fatalf("expected domain target to resolve to 100.77.0.10:443 before DialContext, got %q", dialedDest)
 	}
 }

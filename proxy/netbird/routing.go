@@ -2,11 +2,13 @@ package netbird
 
 import (
 	"context"
+	stderrors "errors"
 	"net/netip"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/netbirdio/netbird/client/embed"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/features/dns"
 	"github.com/xtls/xray-core/features/routing"
@@ -20,19 +22,22 @@ const (
 var defaultOverlayPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 type routeSnapshot struct {
-	overlayPrefixes  []netip.Prefix
-	clientPrefixes   []netip.Prefix
-	exitNodeV4       bool
-	exitNodeV6       bool
-	exitNodeIDs      []string
-	selectedExitNode string
-	routeExact       map[string]struct{}
-	routeWildcard    []string
+	overlayPrefixes   []netip.Prefix
+	clientPrefixes    []netip.Prefix
+	exitNodeV4        bool
+	exitNodeV6        bool
+	exitNodeIDs       []string
+	selectedExitNode  string
+	hasDefaultDNS     bool
+	searchDomains     []string
+	routeExact        map[string]struct{}
+	routeWildcard     []string
 	dnsExact          map[string]struct{}
 	dnsWildcard       []string
 	dnsSubdomainBases []string
 	dnsDomains        []string
 	peerFQDNs         map[string]struct{}
+	peerShortNames    map[string]struct{}
 	allRoutes         []string
 }
 
@@ -93,6 +98,11 @@ func (s *routeSnapshot) matchDomain(domain string) bool {
 	}
 	if _, ok := s.peerFQDNs[norm]; ok {
 		return true
+	}
+	if !strings.Contains(norm, ".") {
+		if _, ok := s.peerShortNames[norm]; ok {
+			return true
+		}
 	}
 	if matchDomainPattern(s.routeExact, s.routeWildcard, nil, norm) {
 		return true
@@ -208,12 +218,24 @@ func (h *Handler) refreshRouteSnapshotFromClient(client netbirdClient) {
 	}
 
 	peerFQDNs := make(map[string]struct{}, len(table.PeerFQDNs))
+	peerShortNames := make(map[string]struct{}, len(table.PeerFQDNs))
 	for _, fqdn := range table.PeerFQDNs {
 		norm := normalizeRoutingDomain(fqdn)
 		if norm != "" {
 			peerFQDNs[norm] = struct{}{}
+			if first, _, _ := strings.Cut(norm, "."); first != "" {
+				peerShortNames[first] = struct{}{}
+			}
 		}
 	}
+
+	searchDomains := make([]string, 0, len(table.SearchDomains))
+	for _, sd := range table.SearchDomains {
+		if norm := normalizeRoutingDomain(sd); norm != "" && norm != "." {
+			searchDomains = append(searchDomains, norm)
+		}
+	}
+	slices.Sort(searchDomains)
 
 	routeStrSet := make(map[string]struct{})
 	var allRoutes []string
@@ -252,6 +274,8 @@ func (h *Handler) refreshRouteSnapshotFromClient(client netbirdClient) {
 		exitNodeV6:        table.ExitNodeV6 && h.enableExitNode,
 		exitNodeIDs:       slices.Clone(table.ExitNodeIDs),
 		selectedExitNode:  table.SelectedExitNode,
+		hasDefaultDNS:     table.HasDefaultDNS,
+		searchDomains:     searchDomains,
 		routeExact:        routeExact,
 		routeWildcard:     routeWildcard,
 		dnsExact:          dnsExact,
@@ -259,6 +283,7 @@ func (h *Handler) refreshRouteSnapshotFromClient(client netbirdClient) {
 		dnsSubdomainBases: dnsSubdomainBases,
 		dnsDomains:        dnsDomains,
 		peerFQDNs:         peerFQDNs,
+		peerShortNames:    peerShortNames,
 		allRoutes:         allRoutes,
 	})
 }
@@ -293,30 +318,7 @@ func (h *Handler) MatchDomain(domain string) bool {
 	return h.routeSnap.Load().matchDomain(norm)
 }
 
-// LookupIP implements features/dns.DynamicResolver.
-func (h *Handler) LookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
-	client := h.getClient()
-	if client == nil {
-		return nil, 0, dns.ErrEmptyResponse
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	lookupCtx, cancel := context.WithTimeout(ctx, dynamicLookupTimeout)
-	defer cancel()
-
-	addrs, ttl, err := client.LookupIP(lookupCtx, domain, option.IPv4Enable, option.IPv6Enable)
-	if err != nil {
-		return nil, 0, err
-	}
-	if len(addrs) > 0 && h.routeSnap.Load().matchRouteDomain(domain) {
-		h.recordDynamicRouteAddrs(addrs)
-	}
-	h.refreshRouteSnapshotFromClient(client)
-	if len(addrs) == 0 {
-		return nil, 0, dns.ErrEmptyResponse
-	}
-
+func addrsToNetIPs(addrs []netip.Addr) []net.IP {
 	ips := make([]net.IP, 0, len(addrs))
 	for _, addr := range addrs {
 		unmapped := addr.Unmap()
@@ -328,10 +330,87 @@ func (h *Handler) LookupIP(ctx context.Context, domain string, option dns.IPOpti
 			ips = append(ips, net.IP(b[:]))
 		}
 	}
+	return ips
+}
+
+func mapNetBirdDNSError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if stderrors.Is(err, embed.ErrDNSFallthrough) {
+		return dns.ErrDynamicFallthrough
+	}
+	var rcErr *embed.DNSRcodeError
+	if stderrors.As(err, &rcErr) && rcErr.Rcode > 0 {
+		return dns.RCodeError(rcErr.Rcode)
+	}
+	return err
+}
+
+// LookupIP implements features/dns.DynamicResolver.
+func (h *Handler) LookupIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, error) {
+	client := h.getClient()
+	if client == nil {
+		return nil, 0, dns.ErrDynamicFallthrough
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, dynamicLookupTimeout)
+	defer cancel()
+
+	addrs, ttl, err := client.LookupIP(lookupCtx, domain, option.IPv4Enable, option.IPv6Enable)
+	if err != nil {
+		return nil, 0, mapNetBirdDNSError(err)
+	}
+	if len(addrs) > 0 && h.routeSnap.Load().matchRouteDomain(domain) {
+		h.recordDynamicRouteAddrs(addrs)
+	}
+	h.refreshRouteSnapshotFromClient(client)
+	if len(addrs) == 0 {
+		return nil, 0, dns.ErrEmptyResponse
+	}
 	if ttl == 0 {
 		ttl = 60
 	}
-	return ips, ttl, nil
+	return addrsToNetIPs(addrs), ttl, nil
+}
+
+// LookupFallbackIP implements features/dns.DynamicFallbackResolver for NetBird's
+// primary ("All domains") nameserver group and search-domain expansion.
+func (h *Handler) LookupFallbackIP(ctx context.Context, domain string, option dns.IPOption) ([]net.IP, uint32, bool, error) {
+	client := h.getClient()
+	if client == nil {
+		return nil, 0, false, nil
+	}
+	if !client.HasDefaultDNS() && len(h.routeSnap.Load().searchDomains) == 0 {
+		return nil, 0, false, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, dynamicLookupTimeout)
+	defer cancel()
+
+	addrs, ttl, err := client.LookupDefaultIP(lookupCtx, domain, option.IPv4Enable, option.IPv6Enable)
+	if err != nil {
+		mapped := mapNetBirdDNSError(err)
+		if stderrors.Is(mapped, dns.ErrDynamicFallthrough) {
+			return nil, 0, false, nil
+		}
+		return nil, 0, true, mapped
+	}
+	if len(addrs) == 0 {
+		return nil, 0, true, dns.ErrEmptyResponse
+	}
+	if h.routeSnap.Load().matchRouteDomain(domain) {
+		h.recordDynamicRouteAddrs(addrs)
+		h.refreshRouteSnapshotFromClient(client)
+	}
+	if ttl == 0 {
+		ttl = 60
+	}
+	return addrsToNetIPs(addrs), ttl, true, nil
 }
 
 // MatchTarget implements features/routing.NetBirdRouteMatcher.

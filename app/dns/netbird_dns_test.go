@@ -20,8 +20,9 @@ import (
 )
 
 type stubDynamicResolver struct {
-	matchFn  func(domain string) bool
-	lookupFn func(ctx context.Context, domain string, option feature_dns.IPOption) ([]net.IP, uint32, error)
+	matchFn    func(domain string) bool
+	lookupFn   func(ctx context.Context, domain string, option feature_dns.IPOption) ([]net.IP, uint32, error)
+	fallbackFn func(ctx context.Context, domain string, option feature_dns.IPOption) ([]net.IP, uint32, bool, error)
 }
 
 func (s stubDynamicResolver) MatchDomain(domain string) bool {
@@ -30,6 +31,13 @@ func (s stubDynamicResolver) MatchDomain(domain string) bool {
 
 func (s stubDynamicResolver) LookupIP(ctx context.Context, domain string, option feature_dns.IPOption) ([]net.IP, uint32, error) {
 	return s.lookupFn(ctx, domain, option)
+}
+
+func (s stubDynamicResolver) LookupFallbackIP(ctx context.Context, domain string, option feature_dns.IPOption) ([]net.IP, uint32, bool, error) {
+	if s.fallbackFn != nil {
+		return s.fallbackFn(ctx, domain, option)
+	}
+	return nil, 0, false, nil
 }
 
 func TestDynamicResolverTakesPrecedenceAndReturnsNoData(t *testing.T) {
@@ -106,5 +114,39 @@ func TestDynamicResolverTakesPrecedenceAndReturnsNoData(t *testing.T) {
 	})
 	if !stderrors.Is(err, feature_dns.ErrEmptyResponse) {
 		t.Fatalf("expected ErrEmptyResponse on NODATA dynamic match, got %v", err)
+	}
+
+	// Non-authoritative fallthrough lets normal DNS answer; fallback resolver answers on miss.
+	const fallID = "nb-dns-fallthrough-test"
+	feature_dns.RegisterDynamicResolver(fallID, stubDynamicResolver{
+		matchFn: func(domain string) bool {
+			return domain == "fall.example.com"
+		},
+		lookupFn: func(_ context.Context, _ string, _ feature_dns.IPOption) ([]net.IP, uint32, error) {
+			return nil, 0, feature_dns.ErrDynamicFallthrough
+		},
+		fallbackFn: func(_ context.Context, domain string, option feature_dns.IPOption) ([]net.IP, uint32, bool, error) {
+			if domain == "primary.internal" && option.IPv4Enable {
+				return []net.IP{net.ParseAddress("10.50.0.5").IP()}, 45, true, nil
+			}
+			return nil, 0, false, nil
+		},
+	})
+	defer feature_dns.UnregisterDynamicResolver(fallID)
+
+	fallIPs, _, err := d.LookupIP("fall.example.com", feature_dns.IPOption{
+		IPv4Enable: true,
+		FakeEnable: true,
+	})
+	if err != nil || len(fallIPs) == 0 || fallIPs[0][0] != 198 {
+		t.Fatalf("expected FakeDNS after dynamic fallthrough, got ips=%v err=%v", fallIPs, err)
+	}
+
+	fbIPs, fbTTL, err := d.LookupIP("primary.internal", feature_dns.IPOption{
+		IPv4Enable: true,
+		FakeEnable: false,
+	})
+	if err != nil || fbTTL != 45 || len(fbIPs) != 1 || fbIPs[0].String() != "10.50.0.5" {
+		t.Fatalf("expected fallback primary DNS result, got ips=%v ttl=%d err=%v", fbIPs, fbTTL, err)
 	}
 }

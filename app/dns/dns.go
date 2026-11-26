@@ -304,14 +304,24 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 	}
 
 	// Name servers lookup
+	var ips []net.IP
+	var ttl uint32
+	var err error
 	if s.script != nil {
-		return s.script.query(domain, option)
-	}
-	if s.enableParallelQuery {
-		return s.parallelQuery(domain, option)
+		ips, ttl, err = s.script.query(domain, option)
+	} else if s.enableParallelQuery {
+		ips, ttl, err = s.parallelQuery(domain, option)
 	} else {
-		return s.serialQuery(domain, option)
+		ips, ttl, err = s.serialQuery(domain, option)
 	}
+	if len(ips) > 0 {
+		return ips, ttl, err
+	}
+
+	if fbIPs, fbTTL, fbMatched, fbErr := dns.LookupDynamicFallback(s.ctx, domain, option); fbMatched && fbErr == nil && len(fbIPs) > 0 {
+		return fbIPs, fbTTL, nil
+	}
+	return ips, ttl, err
 }
 
 func (s *DNS) sortClients(domain string) []*Client {
