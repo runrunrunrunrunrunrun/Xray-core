@@ -87,7 +87,26 @@ type Instance struct {
 	running                    bool
 	resolveLock                sync.Mutex
 
+	startedCh   chan struct{}
+	startedOnce sync.Once
+
 	ctx context.Context
+}
+
+func (s *Instance) ensureStartedChLocked() chan struct{} {
+	if s.startedCh == nil {
+		s.startedCh = make(chan struct{})
+	}
+	return s.startedCh
+}
+
+// Started returns a channel closed once Instance.Start finishes starting all
+// registered features or when Instance.Close is called.
+func (s *Instance) Started() <-chan struct{} {
+	s.statusLock.Lock()
+	ch := s.ensureStartedChLocked()
+	s.statusLock.Unlock()
+	return ch
 }
 
 // Instance state
@@ -167,7 +186,10 @@ func OptionalFeatures(ctx context.Context, callback interface{}) error {
 // The instance is not started at this point.
 // To ensure Xray instance works properly, the config must contain one Dispatcher, one InboundHandlerManager and one OutboundHandlerManager. Other features are optional.
 func New(config *Config) (*Instance, error) {
-	server := &Instance{ctx: context.Background()}
+	server := &Instance{
+		ctx:       context.Background(),
+		startedCh: make(chan struct{}),
+	}
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
@@ -178,7 +200,10 @@ func New(config *Config) (*Instance, error) {
 }
 
 func NewWithContext(ctx context.Context, config *Config) (*Instance, error) {
-	server := &Instance{ctx: ctx}
+	server := &Instance{
+		ctx:       ctx,
+		startedCh: make(chan struct{}),
+	}
 
 	done, err := initInstanceWithConfig(config, server)
 	if done {
@@ -263,6 +288,10 @@ func (s *Instance) Close() error {
 	defer s.statusLock.Unlock()
 
 	s.running = false
+	ch := s.ensureStartedChLocked()
+	s.startedOnce.Do(func() {
+		close(ch)
+	})
 
 	var errs []interface{}
 	for _, f := range s.features {
@@ -394,6 +423,11 @@ func (s *Instance) Start() error {
 			return err
 		}
 	}
+
+	ch := s.ensureStartedChLocked()
+	s.startedOnce.Do(func() {
+		close(ch)
+	})
 
 	errors.LogWarning(s.ctx, "Xray ", Version(), " started")
 

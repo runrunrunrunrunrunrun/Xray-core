@@ -22,6 +22,7 @@ import (
 	featurepolicy "github.com/xtls/xray-core/features/policy"
 	featurestats "github.com/xtls/xray-core/features/stats"
 	"github.com/xtls/xray-core/transport"
+	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/pipe"
 )
 
@@ -576,6 +577,36 @@ func TestOutboundInterfaceRefCountAndOverride(t *testing.T) {
 	if got := nbnet.GetExternalOutboundInterface(); got != "" {
 		t.Fatalf("after final release = %q, want empty", got)
 	}
+
+	SetOutboundInterface("auto")
+	if got := nbnet.GetExternalOutboundInterface(); got != "" {
+		t.Fatalf("after auto override = %q, want empty", got)
+	}
+	acquireHandlerOutboundInterface(" AUTO ")
+	if got := nbnet.GetExternalOutboundInterface(); got != "" {
+		t.Fatalf("after auto handler acquire = %q, want empty", got)
+	}
+
+	t.Cleanup(func() {
+		internet.SetTunOutboundInterface("")
+	})
+	internet.SetTunOutboundInterface("Ethernet")
+	if got := nbnet.GetExternalOutboundInterface(); got != "Ethernet" {
+		t.Fatalf("with TUN fallback = %q, want Ethernet", got)
+	}
+
+	acquireHandlerOutboundInterface("eth1")
+	if got := nbnet.GetExternalOutboundInterface(); got != "eth1" {
+		t.Fatalf("handler override over TUN = %q, want eth1", got)
+	}
+	releaseHandlerOutboundInterface("eth1")
+	if got := nbnet.GetExternalOutboundInterface(); got != "Ethernet" {
+		t.Fatalf("restored TUN fallback = %q, want Ethernet", got)
+	}
+	internet.SetTunOutboundInterface("")
+	if got := nbnet.GetExternalOutboundInterface(); got != "" {
+		t.Fatalf("after clearing TUN fallback = %q, want empty", got)
+	}
 }
 
 func TestHandlerDoesNotStartBeforeStartIsCalled(t *testing.T) {
@@ -651,6 +682,81 @@ func TestHandlerDoesNotStartBeforeStartIsCalled(t *testing.T) {
 	}
 	if got := nbnet.GetExternalOutboundInterface(); got != "" {
 		t.Fatalf("expected empty outbound interface after Close(), got %q", got)
+	}
+}
+
+func TestHandlerStartWaitsForInstanceStarted(t *testing.T) {
+	pm := newTestPolicyManager(t)
+	instance, err := core.New(&core.Config{})
+	if err != nil {
+		t.Fatalf("core.New failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = instance.Close()
+	})
+
+	var startCalled atomic.Bool
+	h := &Handler{
+		policyManager:   pm,
+		startupTimeout:  2 * time.Second,
+		baseOpts:        embed.Options{SetupKey: "barrier-key"},
+		instanceStarted: instance.Started(),
+		newClientFn: func(opts embed.Options) (netbirdClient, error) {
+			return &fakeNetbirdClient{
+				startFn: func(context.Context) error {
+					startCalled.Store(true)
+					return nil
+				},
+			}, nil
+		},
+		state: stateIdle,
+	}
+	h.registerHandler("nb-barrier-test")
+	t.Cleanup(func() {
+		_ = h.Close()
+	})
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if startCalled.Load() {
+		t.Fatal("expected NetBird client.Start to wait until instance.Start completes")
+	}
+
+	if err := instance.Start(); err != nil {
+		t.Fatalf("instance.Start() failed: %v", err)
+	}
+	if err := h.ensureStarted(context.Background()); err != nil {
+		t.Fatalf("ensureStarted() failed: %v", err)
+	}
+	if !startCalled.Load() {
+		t.Fatal("expected NetBird client.Start to run after instance.Start")
+	}
+
+	// Verify Close unblocks a handler still waiting on an unstarted instance.
+	unstartedInstance, err := core.New(&core.Config{})
+	if err != nil {
+		t.Fatalf("core.New failed: %v", err)
+	}
+	defer unstartedInstance.Close()
+
+	hBlocked := &Handler{
+		policyManager:   pm,
+		startupTimeout:  2 * time.Second,
+		baseOpts:        embed.Options{SetupKey: "barrier-close-key"},
+		instanceStarted: unstartedInstance.Started(),
+		newClientFn: func(opts embed.Options) (netbirdClient, error) {
+			return &fakeNetbirdClient{}, nil
+		},
+		state: stateIdle,
+	}
+	hBlocked.registerHandler("nb-barrier-close-test")
+	if err := hBlocked.Start(); err != nil {
+		t.Fatalf("hBlocked.Start() failed: %v", err)
+	}
+	if err := hBlocked.Close(); err != nil {
+		t.Fatalf("hBlocked.Close() failed: %v", err)
 	}
 }
 

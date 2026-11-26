@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/transport/internet"
 )
 
 type InterfaceUpdater struct {
@@ -33,12 +34,14 @@ func (updater *InterfaceUpdater) Update() {
 	if err != nil {
 		errors.LogInfoInner(context.Background(), err, "[tun] failed to update interface")
 		updater.iface = nil
+		internet.SetTunOutboundInterface("")
 		return
 	}
 
 	if got == nil {
 		errors.LogInfo(context.Background(), "[tun] failed to update interface > got == nil")
 		updater.iface = nil
+		internet.SetTunOutboundInterface("")
 		return
 	}
 
@@ -47,5 +50,6 @@ func (updater *InterfaceUpdater) Update() {
 	}
 
 	updater.iface = got
+	internet.SetTunOutboundInterface(got.Name)
 	errors.LogInfo(context.Background(), "[tun] update interface ", got.Name, " ", got.Index)
 }

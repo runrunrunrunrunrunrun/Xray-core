@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	defaultStartupTimeout = 30 * time.Second
+	defaultStartupTimeout = 60 * time.Second
 	shutdownTimeout       = 5 * time.Second
 )
 
@@ -66,14 +66,15 @@ type Handler struct {
 	downlinkCounter stats.Counter
 	registryKey     string
 
-	oauthMode     bool
-	outboundIface string
-	ifaceAcquired bool
-	baseOpts      embed.Options
-	managementURL string
-	configPath    string
-	newClientFn   clientFactoryFn
-	oauthLoginFn  oauthLoginFn
+	oauthMode       bool
+	outboundIface   string
+	ifaceAcquired   bool
+	baseOpts        embed.Options
+	managementURL   string
+	configPath      string
+	instanceStarted <-chan struct{}
+	newClientFn     clientFactoryFn
+	oauthLoginFn    oauthLoginFn
 
 	mu           sync.Mutex
 	client       netbirdClient
@@ -184,6 +185,7 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		baseOpts:        opts,
 		managementURL:   conf.ManagementUrl,
 		configPath:      conf.ConfigPath,
+		instanceStarted: v.Started(),
 		newClientFn:     defaultNewClient,
 		oauthLoginFn:    obtainOAuthToken,
 		state:           stateIdle,
@@ -323,13 +325,27 @@ func (h *Handler) triggerStartLocked() {
 	if h.oauthMode {
 		totalTimeout = h.oauthTimeout + h.startupTimeout
 	}
-	startCtx, cancel := context.WithTimeout(context.Background(), totalTimeout)
+	baseCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
+	startedCh := h.instanceStarted
 	h.startCancel = cancel
 	h.startDone = done
 
 	go func() {
-		client, err := h.startClient(startCtx)
+		var client netbirdClient
+		var err error
+		if startedCh != nil {
+			select {
+			case <-startedCh:
+			case <-baseCtx.Done():
+				err = baseCtx.Err()
+			}
+		}
+		if err == nil {
+			startCtx, timeoutCancel := context.WithTimeout(baseCtx, totalTimeout)
+			client, err = h.startClient(startCtx)
+			timeoutCancel()
+		}
 		cancel()
 
 		h.mu.Lock()
@@ -361,6 +377,14 @@ func (h *Handler) triggerStartLocked() {
 	}()
 }
 
+func (h *Handler) setClient(c netbirdClient) {
+	h.mu.Lock()
+	if h.state != stateClosed {
+		h.client = c
+	}
+	h.mu.Unlock()
+}
+
 func (h *Handler) startClient(startCtx context.Context) (netbirdClient, error) {
 	if !h.oauthMode {
 		h.mu.Lock()
@@ -378,6 +402,7 @@ func (h *Handler) startClient(startCtx context.Context) (netbirdClient, error) {
 			if err != nil {
 				return nil, errors.New("failed to create netbird client").Base(err)
 			}
+			h.setClient(client)
 		}
 		if err := client.Start(startCtx); err != nil {
 			return nil, err
@@ -393,6 +418,7 @@ func (h *Handler) startClient(startCtx context.Context) (netbirdClient, error) {
 		opts.SetupKey = ""
 
 		if c, err := h.newClientFn(opts); err == nil {
+			h.setClient(c)
 			connectCtx, connectCancel := context.WithTimeout(startCtx, h.startupTimeout)
 			startErr := c.Start(connectCtx)
 			connectCancel()
@@ -424,6 +450,7 @@ func (h *Handler) startClient(startCtx context.Context) (netbirdClient, error) {
 	if err != nil {
 		return nil, errors.New("failed to create netbird client after OAuth").Base(err)
 	}
+	h.setClient(c)
 
 	connectCtx, connectCancel := context.WithTimeout(startCtx, h.startupTimeout)
 	defer connectCancel()

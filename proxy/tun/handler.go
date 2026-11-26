@@ -181,6 +181,7 @@ func (t *Handler) Start() error {
 
 	err = tunStack.Start()
 	if err != nil {
+		internet.SetTunOutboundInterface("")
 		_ = tunStack.Close()
 		_ = tunInterface.Close()
 		return err
@@ -188,6 +189,7 @@ func (t *Handler) Start() error {
 
 	err = tunInterface.Start()
 	if err != nil {
+		internet.SetTunOutboundInterface("")
 		_ = tunStack.Close()
 		_ = tunInterface.Close()
 		return err
@@ -199,6 +201,7 @@ func (t *Handler) Start() error {
 		ConfigureSystemDNS(context.Context, string) error
 	}); ok {
 		if err := c.ConfigureSystemDNS(t.ctx, t.tag); err != nil {
+			internet.SetTunOutboundInterface("")
 			_ = tunStack.Close()
 			_ = tunInterface.Close()
 			return errors.New("unable to set the system DNS (remove autoSystemDnsToGateway to run without)").Base(err)
@@ -272,6 +275,9 @@ func (t *Handler) Close() error {
 	// and the tun
 	if t.cancel != nil {
 		t.cancel()
+	}
+	if t.config != nil && t.config.AutoOutboundsInterface != "" {
+		internet.SetTunOutboundInterface("")
 	}
 	return errors.Combine(common.CloseIfExists(t.stack), common.CloseIfExists(t.tun))
 }

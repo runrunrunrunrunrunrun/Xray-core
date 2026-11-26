@@ -71,7 +71,7 @@ func (c *NetBirdConfig) Build() (proto.Message, error) {
 
 	startupTimeout := c.StartupTimeout
 	if startupTimeout == 0 {
-		startupTimeout = 30
+		startupTimeout = 60
 	}
 
 	config := &netbird.Config{

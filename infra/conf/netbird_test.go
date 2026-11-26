@@ -55,7 +55,7 @@ func TestNetBirdConfig(t *testing.T) {
 				LazyConnection:      &lazyFalse,
 				DnsLabels:           []string{"corp", "internal"},
 				NatExternalIps:      []string{"1.2.3.4/10.0.0.2"},
-				StartupTimeout:      30,
+				StartupTimeout:      60,
 			},
 		},
 		{
@@ -83,7 +83,7 @@ func TestNetBirdConfig(t *testing.T) {
 				PrivateKey:     "priv-key",
 				PreSharedKey:   "psk",
 				BlockInbound:   true,
-				StartupTimeout: 30,
+				StartupTimeout: 60,
 			},
 		},
 		{
@@ -91,7 +91,7 @@ func TestNetBirdConfig(t *testing.T) {
 			Parser: loadJSON(creator),
 			Output: &netbird.Config{
 				BlockInbound:   true,
-				StartupTimeout: 30,
+				StartupTimeout: 60,
 			},
 		},
 	})

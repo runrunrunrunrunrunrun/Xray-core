@@ -5,6 +5,8 @@ import (
 	stderrors "errors"
 	"testing"
 	"time"
+
+	"github.com/netbirdio/netbird/client/embed"
 )
 
 func TestHandlerStatusSnapshotAndExpvar(t *testing.T) {
@@ -97,5 +99,65 @@ func TestHandlerStatusSnapshotAndExpvar(t *testing.T) {
 	}
 	if setupSnap.LastError == "" {
 		t.Fatal("expected LastError to be preserved for SetupKey error")
+	}
+}
+
+func TestHandlerStatusSnapshotWhileStarting(t *testing.T) {
+	pm := newTestPolicyManager(t)
+	inStart := make(chan struct{})
+	release := make(chan struct{})
+
+	h := &Handler{
+		policyManager:  pm,
+		startupTimeout: 2 * time.Second,
+		baseOpts:       embed.Options{SetupKey: "starting-key", DeviceName: "win-dev"},
+		managementURL:  "https://net.l0op.site",
+		newClientFn: func(opts embed.Options) (netbirdClient, error) {
+			return &fakeNetbirdClient{
+				startFn: func(ctx context.Context) error {
+					close(inStart)
+					<-release
+					return nil
+				},
+				statusSnapshotFn: func() (*StatusDetail, error) {
+					return &StatusDetail{
+						ManagementConnected: true,
+						SignalConnected:     false,
+						SignalError:         "dial signal failed",
+					}, nil
+				},
+			}, nil
+		},
+		state: stateIdle,
+	}
+	h.registerHandler("nb-starting-status")
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+		_ = h.Close()
+	}()
+
+	if err := h.Start(); err != nil {
+		t.Fatalf("Start() failed: %v", err)
+	}
+	<-inStart
+
+	snap := h.StatusSnapshot()
+	if snap.State != "starting" {
+		t.Fatalf("State = %q, want starting", snap.State)
+	}
+	if !snap.ManagementConnected || snap.SignalConnected {
+		t.Fatalf("unexpected control/signal flags while starting: %+v", snap)
+	}
+	if snap.LastError != "dial signal failed" {
+		t.Fatalf("LastError = %q, want %q", snap.LastError, "dial signal failed")
+	}
+
+	close(release)
+	if err := h.ensureStarted(context.Background()); err != nil {
+		t.Fatalf("ensureStarted() failed: %v", err)
 	}
 }

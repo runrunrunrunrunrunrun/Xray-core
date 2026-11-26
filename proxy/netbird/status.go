@@ -13,7 +13,9 @@ import (
 // StatusDetail holds live runtime status extracted from an embedded NetBird client.
 type StatusDetail struct {
 	ManagementConnected   bool                  `json:"managementConnected"`
+	ManagementError       string                `json:"managementError,omitempty"`
 	SignalConnected       bool                  `json:"signalConnected"`
+	SignalError           string                `json:"signalError,omitempty"`
 	LocalIP               string                `json:"localIp,omitempty"`
 	LocalIPv6             string                `json:"localIpv6,omitempty"`
 	FQDN                  string                `json:"fqdn,omitempty"`
@@ -90,6 +92,12 @@ func (a embedClientAdapter) StatusSnapshot() (*StatusDetail, error) {
 		PubKey:                full.LocalPeerState.PubKey,
 		LazyConnectionEnabled: full.LazyConnectionEnabled,
 		PeersTotal:            len(full.Peers),
+	}
+	if full.ManagementState.Error != nil {
+		detail.ManagementError = full.ManagementState.Error.Error()
+	}
+	if full.SignalState.Error != nil {
+		detail.SignalError = full.SignalState.Error.Error()
 	}
 
 	routeSet := make(map[string]struct{})
@@ -258,10 +266,9 @@ func (h *Handler) StatusSnapshot() StatusSnapshot {
 		snap.LastError = h.lastStartErr.Error()
 	}
 	client := h.client
-	started := h.state == stateStarted
 	h.mu.Unlock()
 
-	if started && client != nil {
+	if client != nil {
 		if detail, err := client.StatusSnapshot(); err == nil && detail != nil {
 			snap.ManagementConnected = detail.ManagementConnected
 			snap.SignalConnected = detail.SignalConnected
@@ -275,6 +282,13 @@ func (h *Handler) StatusSnapshot() StatusSnapshot {
 			snap.Relays = detail.Relays
 			snap.Peers = detail.Peers
 			snap.Routes = detail.Routes
+			if snap.LastError == "" {
+				if detail.SignalError != "" {
+					snap.LastError = detail.SignalError
+				} else if detail.ManagementError != "" {
+					snap.LastError = detail.ManagementError
+				}
+			}
 		} else if err != nil && snap.LastError == "" {
 			snap.LastError = err.Error()
 		}
