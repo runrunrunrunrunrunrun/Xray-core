@@ -44,6 +44,7 @@ type Config struct {
 	DnsLabels           []string               `protobuf:"bytes,19,rep,name=dns_labels,json=dnsLabels,proto3" json:"dns_labels,omitempty"`
 	NatExternalIps      []string               `protobuf:"bytes,20,rep,name=nat_external_ips,json=natExternalIps,proto3" json:"nat_external_ips,omitempty"`
 	StartupTimeout      uint32                 `protobuf:"varint,21,opt,name=startup_timeout,json=startupTimeout,proto3" json:"startup_timeout,omitempty"`
+	EnableExitNode      bool                   `protobuf:"varint,22,opt,name=enable_exit_node,json=enableExitNode,proto3" json:"enable_exit_node,omitempty"`
 	unknownFields       protoimpl.UnknownFields
 	sizeCache           protoimpl.SizeCache
 }
@@ -225,11 +226,18 @@ func (x *Config) GetStartupTimeout() uint32 {
 	return 0
 }
 
+func (x *Config) GetEnableExitNode() bool {
+	if x != nil {
+		return x.EnableExitNode
+	}
+	return false
+}
+
 var File_proxy_netbird_config_proto protoreflect.FileDescriptor
 
 const file_proxy_netbird_config_proto_rawDesc = "" +
 	"\n" +
-	"\x1aproxy/netbird/config.proto\x12\x12xray.proxy.netbird\"\xb7\x06\n" +
+	"\x1aproxy/netbird/config.proto\x12\x12xray.proxy.netbird\"\xe1\x06\n" +
 	"\x06Config\x12\x1f\n" +
 	"\vdevice_name\x18\x01 \x01(\tR\n" +
 	"deviceName\x12\x1b\n" +
@@ -257,7 +265,8 @@ const file_proxy_netbird_config_proto_rawDesc = "" +
 	"\n" +
 	"dns_labels\x18\x13 \x03(\tR\tdnsLabels\x12(\n" +
 	"\x10nat_external_ips\x18\x14 \x03(\tR\x0enatExternalIps\x12'\n" +
-	"\x0fstartup_timeout\x18\x15 \x01(\rR\x0estartupTimeoutB\x11\n" +
+	"\x0fstartup_timeout\x18\x15 \x01(\rR\x0estartupTimeout\x12(\n" +
+	"\x10enable_exit_node\x18\x16 \x01(\bR\x0eenableExitNodeB\x11\n" +
 	"\x0f_wireguard_portB\x12\n" +
 	"\x10_lazy_connectionBX\n" +
 	"\x16com.xray.proxy.netbirdP\x01Z'github.com/xtls/xray-core/proxy/netbird\xaa\x02\x12Xray.Proxy.NetBirdb\x06proto3"

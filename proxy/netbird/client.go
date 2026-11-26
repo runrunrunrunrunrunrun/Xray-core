@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/netbirdio/netbird/client/embed"
@@ -41,6 +43,9 @@ type netbirdClient interface {
 	DialContext(ctx context.Context, network, address string) (net.Conn, error)
 	ListenUDP(address string) (net.PacketConn, error)
 	StatusSnapshot() (*StatusDetail, error)
+	RoutingTable() (embed.RoutingTable, error)
+	MatchDNSDomain(domain string) bool
+	LookupIP(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error)
 }
 
 type (
@@ -76,12 +81,17 @@ type Handler struct {
 	newClientFn     clientFactoryFn
 	oauthLoginFn    oauthLoginFn
 
-	mu           sync.Mutex
-	client       netbirdClient
-	state        clientState
-	startCancel  context.CancelFunc
-	startDone    chan struct{}
-	lastStartErr error
+	mu                 sync.Mutex
+	client             netbirdClient
+	state              clientState
+	enableExitNode     bool
+	routeSnap          atomic.Pointer[routeSnapshot]
+	routeRefreshCancel context.CancelFunc
+	extraPrefixesMu    sync.Mutex
+	extraPrefixes      []netip.Prefix
+	startCancel        context.CancelFunc
+	startDone          chan struct{}
+	lastStartErr       error
 }
 
 func defaultNewClient(opts embed.Options) (netbirdClient, error) {
@@ -147,6 +157,7 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		ConfigPath:          conf.ConfigPath,
 		StatePath:           conf.StatePath,
 		DisableClientRoutes: conf.DisableClientRoutes,
+		EnableExitNode:      conf.EnableExitNode,
 		DisableIPv6:         conf.DisableIpv6,
 		BlockInbound:        conf.BlockInbound,
 		BlockLANAccess:      conf.BlockLanAccess,
@@ -189,7 +200,9 @@ func NewClient(ctx context.Context, conf *Config) (*Handler, error) {
 		newClientFn:     defaultNewClient,
 		oauthLoginFn:    obtainOAuthToken,
 		state:           stateIdle,
+		enableExitNode:  conf.EnableExitNode,
 	}
+	h.seedDefaultOverlay()
 	h.registerHandler(tag)
 	return h, nil
 }
@@ -228,6 +241,7 @@ func newHandlerWithTag(tag string, p policy.Manager, client netbirdClient, start
 		downlinkCounter: downlinkCounter,
 		state:           stateIdle,
 	}
+	h.seedDefaultOverlay()
 	h.registerHandler(tag)
 	if autoStart {
 		h.mu.Lock()
@@ -287,6 +301,7 @@ func newOAuthHandlerWithTag(
 		oauthLoginFn:    oauthLoginFn,
 		state:           stateIdle,
 	}
+	h.seedDefaultOverlay()
 	h.registerHandler(tag)
 	if autoStart {
 		h.mu.Lock()
@@ -321,6 +336,7 @@ func validateConfig(conf *Config) error {
 
 func (h *Handler) triggerStartLocked() {
 	h.state = stateStarting
+	h.registerRoutingHooks()
 	totalTimeout := h.startupTimeout
 	if h.oauthMode {
 		totalTimeout = h.oauthTimeout + h.startupTimeout
@@ -348,6 +364,10 @@ func (h *Handler) triggerStartLocked() {
 		}
 		cancel()
 
+		if err == nil && client != nil {
+			h.refreshRouteSnapshotFromClient(client)
+		}
+
 		h.mu.Lock()
 		if h.startDone == done {
 			h.startCancel = nil
@@ -367,6 +387,7 @@ func (h *Handler) triggerStartLocked() {
 			h.client = client
 			h.state = stateStarted
 			h.lastStartErr = nil
+			h.startRouteRefreshLocked()
 		} else {
 			h.state = stateIdle
 			h.lastStartErr = err
@@ -665,6 +686,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 // Close implements common.Closable.
 func (h *Handler) Close() error {
+	h.unregisterRoutingHooks()
 	h.unregisterHandler()
 
 	h.mu.Lock()
@@ -675,6 +697,7 @@ func (h *Handler) Close() error {
 	wasStarted := h.state == stateStarted
 	client := h.client
 	cancel := h.startCancel
+	routeCancel := h.routeRefreshCancel
 	done := h.startDone
 	outboundIface := ""
 	if h.ifaceAcquired {
@@ -683,9 +706,13 @@ func (h *Handler) Close() error {
 	}
 	h.state = stateClosed
 	h.startCancel = nil
+	h.routeRefreshCancel = nil
 	h.mu.Unlock()
 	defer releaseHandlerOutboundInterface(outboundIface)
 
+	if routeCancel != nil {
+		routeCancel()
+	}
 	if cancel != nil {
 		cancel()
 	}

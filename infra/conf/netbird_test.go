@@ -34,6 +34,7 @@ func TestNetBirdConfig(t *testing.T) {
 				"lazyConnection": false,
 				"dnsLabels": ["corp", "internal"],
 				"natExternalIPs": ["1.2.3.4/10.0.0.2"],
+				"enableExitNode": true,
 				"logLevel": "INFO"
 			}`,
 			Parser: loadJSON(creator),
@@ -56,6 +57,7 @@ func TestNetBirdConfig(t *testing.T) {
 				DnsLabels:           []string{"corp", "internal"},
 				NatExternalIps:      []string{"1.2.3.4/10.0.0.2"},
 				StartupTimeout:      60,
+				EnableExitNode:      true,
 			},
 		},
 		{

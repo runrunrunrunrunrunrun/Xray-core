@@ -28,4 +28,5 @@ message Config {
   repeated string dns_labels = 19;
   repeated string nat_external_ips = 20;
   uint32 startup_timeout = 21;
+  bool enable_exit_node = 22;
 }

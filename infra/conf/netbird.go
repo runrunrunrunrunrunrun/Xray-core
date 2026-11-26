@@ -30,6 +30,7 @@ type NetBirdConfig struct {
 	DNSLabels           []string `json:"dnsLabels"`
 	NATExternalIPs      []string `json:"natExternalIPs"`
 	StartupTimeout      uint32   `json:"startupTimeout"`
+	EnableExitNode      bool     `json:"enableExitNode"`
 }
 
 func (c *NetBirdConfig) Build() (proto.Message, error) {
@@ -94,6 +95,7 @@ func (c *NetBirdConfig) Build() (proto.Message, error) {
 		DnsLabels:           c.DNSLabels,
 		NatExternalIps:      c.NATExternalIPs,
 		StartupTimeout:      startupTimeout,
+		EnableExitNode:      c.EnableExitNode,
 	}
 
 	if c.WireguardPort != nil {

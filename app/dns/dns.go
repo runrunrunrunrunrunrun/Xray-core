@@ -295,6 +295,14 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 		return ips, 10, nil // Hosts ttl is 10
 	}
 
+	// Dynamic in-process DNS lookup (e.g. NetBird internal/managed domains)
+	if ips, ttl, matched, err := dns.LookupDynamic(s.ctx, domain, option); matched {
+		if err != nil {
+			return nil, 0, err
+		}
+		return ips, ttl, nil
+	}
+
 	// Name servers lookup
 	if s.script != nil {
 		return s.script.query(domain, option)

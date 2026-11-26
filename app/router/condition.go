@@ -413,3 +413,23 @@ func NewLocalOSMatcher(names []string) *LocalOSMatcher {
 func (m *LocalOSMatcher) Apply(_ routing.Context) bool {
 	return m.matched
 }
+
+// NetBirdMatcher matches connections against a live NetBird handler's synced
+// overlay networks, client routes, domains, and exit-node state.
+type NetBirdMatcher struct {
+	tag  string
+	mode routing.NetBirdRouteMode
+}
+
+// NewNetBirdMatcher constructs a NetBirdMatcher for tag and mode.
+func NewNetBirdMatcher(tag string, mode routing.NetBirdRouteMode) *NetBirdMatcher {
+	return &NetBirdMatcher{
+		tag:  strings.TrimSpace(tag),
+		mode: mode,
+	}
+}
+
+// Apply implements Condition.
+func (m *NetBirdMatcher) Apply(ctx routing.Context) bool {
+	return routing.MatchNetBirdRoute(m.tag, ctx.GetTargetDomain(), ctx.GetTargetIPs(), m.mode)
+}

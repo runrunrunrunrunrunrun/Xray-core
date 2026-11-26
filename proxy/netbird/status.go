@@ -64,11 +64,15 @@ type StatusSnapshot struct {
 	FQDN                  string                `json:"fqdn,omitempty"`
 	PubKey                string                `json:"pubKey,omitempty"`
 	LazyConnectionEnabled bool                  `json:"lazyConnectionEnabled"`
+	EnableExitNode        bool                  `json:"enableExitNode"`
+	ExitNodeAvailable     bool                  `json:"exitNodeAvailable"`
+	ExitNodeActive        bool                  `json:"exitNodeActive"`
 	PeersTotal            int                   `json:"peersTotal"`
 	PeersConnected        int                   `json:"peersConnected"`
 	Relays                []RelayStatusSnapshot `json:"relays,omitempty"`
 	Peers                 []PeerStatusSnapshot  `json:"peers,omitempty"`
 	Routes                []string              `json:"routes,omitempty"`
+	DNSDomains            []string              `json:"dnsDomains,omitempty"`
 	LoginExpired          bool                  `json:"loginExpired"`
 	LastError             string                `json:"lastError,omitempty"`
 }
@@ -253,11 +257,12 @@ func isLoginExpiredErr(err error, hasSetupKey bool) bool {
 func (h *Handler) StatusSnapshot() StatusSnapshot {
 	h.mu.Lock()
 	snap := StatusSnapshot{
-		Tag:           h.registryKey,
-		State:         h.state.String(),
-		DeviceName:    h.baseOpts.DeviceName,
-		ManagementURL: h.managementURL,
-		LoginExpired:  isLoginExpiredErr(h.lastStartErr, h.baseOpts.SetupKey != ""),
+		Tag:            h.registryKey,
+		State:          h.state.String(),
+		DeviceName:     h.baseOpts.DeviceName,
+		ManagementURL:  h.managementURL,
+		EnableExitNode: h.enableExitNode,
+		LoginExpired:   isLoginExpiredErr(h.lastStartErr, h.baseOpts.SetupKey != ""),
 	}
 	if snap.Tag == "" {
 		snap.Tag = "netbird"
@@ -291,6 +296,32 @@ func (h *Handler) StatusSnapshot() StatusSnapshot {
 			}
 		} else if err != nil && snap.LastError == "" {
 			snap.LastError = err.Error()
+		}
+	}
+
+	if routeSnap := h.routeSnap.Load(); routeSnap != nil {
+		snap.ExitNodeAvailable = len(routeSnap.exitNodeIDs) > 0
+		snap.ExitNodeActive = h.enableExitNode && (routeSnap.exitNodeV4 || routeSnap.exitNodeV6)
+		if len(routeSnap.dnsDomains) > 0 {
+			snap.DNSDomains = append([]string(nil), routeSnap.dnsDomains...)
+		}
+		if len(routeSnap.allRoutes) > 0 {
+			seen := make(map[string]struct{}, len(snap.Routes)+len(routeSnap.allRoutes))
+			merged := make([]string, 0, len(snap.Routes)+len(routeSnap.allRoutes))
+			for _, r := range snap.Routes {
+				if _, ok := seen[r]; !ok {
+					seen[r] = struct{}{}
+					merged = append(merged, r)
+				}
+			}
+			for _, r := range routeSnap.allRoutes {
+				if _, ok := seen[r]; !ok {
+					seen[r] = struct{}{}
+					merged = append(merged, r)
+				}
+			}
+			sort.Strings(merged)
+			snap.Routes = merged
 		}
 	}
 

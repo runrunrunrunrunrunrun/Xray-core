@@ -70,11 +70,36 @@ func (rr *RoutingRule) BuildCondition() (Condition, error) {
 	}
 
 	if len(rr.Attributes) > 0 {
+		var netbirdMode routing.NetBirdRouteMode
+		var netbirdTag string
+		for key, value := range rr.Attributes {
+			switch strings.ToLower(key) {
+			case "netbird":
+				mode := routing.NetBirdRouteMode(strings.ToLower(strings.TrimSpace(value)))
+				if mode == routing.NetBirdRouteModeRoutes || mode == routing.NetBirdRouteModeExit {
+					netbirdMode = mode
+				}
+			case "netbirdtag":
+				netbirdTag = strings.TrimSpace(value)
+			}
+		}
+		if netbirdMode != "" {
+			if netbirdTag == "" {
+				netbirdTag = rr.GetTag()
+			}
+			conds.Add(NewNetBirdMatcher(netbirdTag, netbirdMode))
+		}
 		configuredKeys := make(map[string]*regexp.Regexp)
 		for key, value := range rr.Attributes {
-			configuredKeys[strings.ToLower(key)] = regexp.MustCompile(value)
+			lower := strings.ToLower(key)
+			if netbirdMode != "" && (lower == "netbird" || lower == "netbirdtag") {
+				continue
+			}
+			configuredKeys[lower] = regexp.MustCompile(value)
 		}
-		conds.Add(&AttributeMatcher{configuredKeys})
+		if len(configuredKeys) > 0 {
+			conds.Add(&AttributeMatcher{configuredKeys})
+		}
 	}
 
 	if len(rr.Ip) > 0 {

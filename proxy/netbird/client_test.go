@@ -5,6 +5,7 @@ import (
 	stderrors "errors"
 	"io"
 	stdnet "net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -32,6 +33,9 @@ type fakeNetbirdClient struct {
 	dialContextFn    func(ctx context.Context, network, address string) (net.Conn, error)
 	listenUDPFn      func(address string) (net.PacketConn, error)
 	statusSnapshotFn func() (*StatusDetail, error)
+	routingTableFn   func() (embed.RoutingTable, error)
+	matchDNSDomainFn func(domain string) bool
+	lookupIPFn       func(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error)
 
 	startCalls atomic.Int32
 	stopCalls  atomic.Int32
@@ -42,6 +46,27 @@ func (f *fakeNetbirdClient) StatusSnapshot() (*StatusDetail, error) {
 		return f.statusSnapshotFn()
 	}
 	return &StatusDetail{}, nil
+}
+
+func (f *fakeNetbirdClient) RoutingTable() (embed.RoutingTable, error) {
+	if f.routingTableFn != nil {
+		return f.routingTableFn()
+	}
+	return embed.RoutingTable{}, nil
+}
+
+func (f *fakeNetbirdClient) MatchDNSDomain(domain string) bool {
+	if f.matchDNSDomainFn != nil {
+		return f.matchDNSDomainFn(domain)
+	}
+	return false
+}
+
+func (f *fakeNetbirdClient) LookupIP(ctx context.Context, domain string, ipv4, ipv6 bool) ([]netip.Addr, uint32, error) {
+	if f.lookupIPFn != nil {
+		return f.lookupIPFn(ctx, domain, ipv4, ipv6)
+	}
+	return nil, 0, nil
 }
 
 func (f *fakeNetbirdClient) Start(ctx context.Context) error {
